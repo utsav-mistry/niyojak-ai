@@ -16,29 +16,34 @@
 
 const k8s = require("@kubernetes/client-node");
 
-const NAMESPACE     = process.env.NIYOJAK_NAMESPACE  || "niyojak-system";
-const SATURATE_IMAGE = process.env.SATURATE_IMAGE    || "ghcr.io/niyojak/niyojak-saturate:latest";
+const NAMESPACE = process.env.NIYOJAK_NAMESPACE || "niyojak-system";
+const SATURATE_IMAGE = process.env.SATURATE_IMAGE || "ghcr.io/niyojak/niyojak-saturate:latest";
+const SAFE_STRESS_MODE = process.env.NIYOJAK_SAFE_STRESS_MODE !== "false";
 
 // Hard ceiling on how long any stress Job can run — Kubernetes enforces this
 // even if the API call to releaseNode is never made.
-const MAX_STRESS_SECONDS = parseInt(process.env.MAX_STRESS_SEC || "300", 10); // 5 minutes
+const MAX_STRESS_SECONDS = parseInt(
+  process.env.MAX_STRESS_SEC || (SAFE_STRESS_MODE ? "180" : "300"),
+  10
+);
+const HARD_MODE_MAX_SECONDS = 60;
 
 // Predefined stress profiles — presenter picks one, never raw percentages.
 const PROFILES = {
   light: {
-    cpu:    "40",    // % of one vCPU
+    cpu: "40",    // % of one vCPU
     mem_mb: "128",
-    label:  "Light (40% CPU, 128 MB)",
+    label: "Light (40% CPU, 128 MB)",
   },
   moderate: {
-    cpu:    "65",
+    cpu: "65",
     mem_mb: "256",
-    label:  "Moderate (65% CPU, 256 MB)",
+    label: "Moderate (65% CPU, 256 MB)",
   },
   heavy: {
-    cpu:    "85",
+    cpu: "85",
     mem_mb: "512",
-    label:  "Heavy (85% CPU, 512 MB)",
+    label: "Heavy (85% CPU, 512 MB)",
   },
 };
 
@@ -60,12 +65,17 @@ function jobName(nodeName) {
  * @param {string} profile    - one of: "light" | "moderate" | "heavy"
  * @returns {{ ok: boolean, job: string, profile: string, expiresInSec: number }}
  */
-async function stressNode(nodeName, profile = "moderate") {
+async function stressNode(nodeName, profile = "light") {
   const config = PROFILES[profile];
   if (!config) {
     throw new Error(`Unknown stress profile "${profile}". Valid: ${Object.keys(PROFILES).join(", ")}`);
   }
 
+  if (SAFE_STRESS_MODE && profile === "heavy") {
+    throw new Error("Heavy stress is disabled in safe mode. Use light or moderate instead.");
+  }
+
+  const effectiveDuration = profile === "heavy" ? HARD_MODE_MAX_SECONDS : MAX_STRESS_SECONDS;
   const name = jobName(nodeName);
 
   const job = {
@@ -75,8 +85,8 @@ async function stressNode(nodeName, profile = "moderate") {
       name,
       namespace: NAMESPACE,
       labels: {
-        "niyojak/role":    "saturate",
-        "niyojak/node":    nodeName,
+        "niyojak/role": "saturate",
+        "niyojak/node": nodeName,
         "niyojak/profile": profile,
       },
       annotations: {
@@ -86,7 +96,7 @@ async function stressNode(nodeName, profile = "moderate") {
     },
     spec: {
       // Hard auto-terminate — even if release is never called.
-      activeDeadlineSeconds: MAX_STRESS_SECONDS,
+      activeDeadlineSeconds: effectiveDuration,
       backoffLimit: 0,
       template: {
         metadata: { labels: { "niyojak/role": "saturate" } },
@@ -96,12 +106,12 @@ async function stressNode(nodeName, profile = "moderate") {
           tolerations: [{ operator: "Exists" }],
           containers: [
             {
-              name:  "saturate",
+              name: "saturate",
               image: SATURATE_IMAGE,
               args: [
                 `--cpu=${config.cpu}`,
                 `--mem=${config.mem_mb}`,
-                `--duration=${MAX_STRESS_SECONDS}s`,
+                `--duration=${effectiveDuration}s`,
               ],
               resources: {
                 requests: { cpu: "100m", memory: "64Mi" },
@@ -117,10 +127,10 @@ async function stressNode(nodeName, profile = "moderate") {
 
   try {
     await batchApi.createNamespacedJob(NAMESPACE, job);
-    return { ok: true, job: name, profile: config.label, expiresInSec: MAX_STRESS_SECONDS };
+    return { ok: true, job: name, profile: config.label, expiresInSec: effectiveDuration, safeMode: SAFE_STRESS_MODE, hardModeCapSec: HARD_MODE_MAX_SECONDS };
   } catch (err) {
     if (err.statusCode === 409) {
-      return { ok: true, job: name, note: "already running", profile: config.label, expiresInSec: MAX_STRESS_SECONDS };
+      return { ok: true, job: name, note: "already running", profile: config.label, expiresInSec: effectiveDuration, safeMode: SAFE_STRESS_MODE, hardModeCapSec: HARD_MODE_MAX_SECONDS };
     }
     throw err;
   }
@@ -156,9 +166,9 @@ async function activeStressJobs() {
   return res.body.items
     .filter(j => !j.status.completionTime)  // exclude finished/expired Jobs
     .map(j => ({
-      nodeName:   j.metadata.labels["niyojak/node"],
-      profile:    j.metadata.annotations?.["niyojak/profile-label"] || "unknown",
-      startedAt:  j.metadata.annotations?.["niyojak/started-at"] || "",
+      nodeName: j.metadata.labels["niyojak/node"],
+      profile: j.metadata.annotations?.["niyojak/profile-label"] || "unknown",
+      startedAt: j.metadata.annotations?.["niyojak/started-at"] || "",
       expiresInSec: MAX_STRESS_SECONDS,
     }));
 }

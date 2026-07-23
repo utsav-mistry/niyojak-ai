@@ -84,14 +84,14 @@ function renderNodes(nodes, stressedNodes) {
 
 function nodeCardHTML(node, stressedNodes) {
   const stressed = stressedNodes.includes(node.node_name);
-  const cpu    = Math.round((node.features.cpu_mean  || 0) * 100);
-  const mem    = Math.round((node.features.mem_mean  || 0) * 100);
-  const load   = (node.features.load_mean || 0).toFixed(2);
-  const score  = node.score;
+  const cpu = Math.round((node.features.cpu_mean || 0) * 100);
+  const mem = Math.round((node.features.mem_mean || 0) * 100);
+  const load = (node.features.load_mean || 0).toFixed(2);
+  const score = node.score;
 
   const scoreClass = score >= 70 ? 'high' : score >= 40 ? 'mid' : 'low';
-  const cpuClass   = cpu <= 50   ? 'green' : cpu <= 75 ? 'yellow' : 'red';
-  const memClass   = mem <= 60   ? 'green' : mem <= 80 ? 'yellow' : 'red';
+  const cpuClass = cpu <= 50 ? 'green' : cpu <= 75 ? 'yellow' : 'red';
+  const memClass = mem <= 60 ? 'green' : mem <= 80 ? 'yellow' : 'red';
 
   const statusTag = stressed
     ? ''   // handled by CSS ::before on .node-card--stressed
@@ -142,9 +142,9 @@ function nodeCardHTML(node, stressedNodes) {
 
       <div class="node-card__actions">
         ${stressed
-          ? `<button class="btn btn--success" data-release="${esc(node.node_name)}">Release Stress</button>`
-          : `<button class="btn btn--danger"  data-stress="${esc(node.node_name)}">Stress Node</button>`
-        }
+      ? `<button class="btn btn--success" data-release="${esc(node.node_name)}">Release Stress</button>`
+      : `<button class="btn btn--danger"  data-stress="${esc(node.node_name)}">Stress Node</button>`
+    }
       </div>
     </div>
   `;
@@ -176,10 +176,10 @@ function renderPodMap(pods) {
       <div class="pod-map__node-label">${esc(node)}</div>
       <div class="pod-map__pods">
         ${nodePods.map(pod => {
-          const isNew = !lastPodNames.has(pod.name);
-          const cls   = isNew ? 'pod-chip pod-chip--new' : pod.ready ? 'pod-chip pod-chip--ready' : 'pod-chip';
-          return `<span class="${cls}" title="${esc(pod.phase)}">${esc(pod.name.split('-').slice(-2).join('-'))}</span>`;
-        }).join('')}
+    const isNew = !lastPodNames.has(pod.name);
+    const cls = isNew ? 'pod-chip pod-chip--new' : pod.ready ? 'pod-chip pod-chip--ready' : 'pod-chip';
+    return `<span class="${cls}" title="${esc(pod.phase)}">${esc(pod.name.split('-').slice(-2).join('-'))}</span>`;
+  }).join('')}
       </div>
     </div>
   `).join('');
@@ -195,25 +195,25 @@ function renderFloodStats(flood) {
   if (!flood) return;
 
   const startBtn = document.getElementById('flood-start-btn');
-  const stopBtn  = document.getElementById('flood-stop-btn');
+  const stopBtn = document.getElementById('flood-stop-btn');
   const activeBar = document.getElementById('flood-active-bar');
-  const statsDiv  = document.getElementById('flood-stats');
+  const statsDiv = document.getElementById('flood-stats');
 
   if (flood.active) {
     startBtn.disabled = true;
-    stopBtn.disabled  = false;
+    stopBtn.disabled = false;
     activeBar.style.display = 'flex';
-    statsDiv.style.display  = 'grid';
+    statsDiv.style.display = 'grid';
 
     document.getElementById('stat-sent').textContent = fmtNum(flood.sent);
-    document.getElementById('stat-rps').textContent  = fmtNum(flood.actualRps);
-    document.getElementById('stat-ok').textContent   = fmtNum(flood.success);
-    document.getElementById('stat-err').textContent  = fmtNum(flood.failed);
+    document.getElementById('stat-rps').textContent = fmtNum(flood.actualRps);
+    document.getElementById('stat-ok').textContent = fmtNum(flood.success);
+    document.getElementById('stat-err').textContent = fmtNum(flood.failed);
   } else {
     startBtn.disabled = false;
-    stopBtn.disabled  = true;
+    stopBtn.disabled = true;
     activeBar.style.display = 'none';
-    statsDiv.style.display  = flood.sent > 0 ? 'grid' : 'none';
+    statsDiv.style.display = flood.sent > 0 ? 'grid' : 'none';
   }
 }
 
@@ -230,11 +230,28 @@ async function adminPost(path, body = {}) {
   return r.json();
 }
 
+function getSelectedStressProfile() {
+  const select = document.getElementById('stress-profile-select');
+  const profile = select ? select.value : 'light';
+  if (profile === 'heavy') {
+    alert('Safe mode is active: heavy stress is blocked. Please choose Light or Moderate.');
+    return null;
+  }
+  return profile;
+}
+
 async function stressNode(nodeName) {
+  const profile = getSelectedStressProfile();
+  if (!profile) return;
+
+  if (!window.confirm(`Start ${profile} stress on ${nodeName}? This is a short, reversible demo stress.`)) {
+    return;
+  }
+
   const btn = document.querySelector(`[data-stress="${nodeName}"]`);
   if (btn) { btn.disabled = true; btn.textContent = 'Stressing...'; }
   try {
-    await adminPost('/admin/stress', { nodeName });
+    await adminPost('/admin/stress', { nodeName, profile });
   } catch (e) {
     alert('Failed to stress node: ' + e.message);
   }
@@ -251,7 +268,7 @@ async function releaseNode(nodeName) {
 }
 
 document.getElementById('flood-start-btn').addEventListener('click', async () => {
-  const rps  = parseInt(document.getElementById('rps-input').value, 10);
+  const rps = parseInt(document.getElementById('rps-input').value, 10);
   const conc = parseInt(document.getElementById('conc-input').value, 10);
   await adminPost('/admin/flood/start', { rps, concurrency: conc });
 });
