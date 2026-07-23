@@ -1,0 +1,358 @@
+/* styles.css — shared dark glassmorphism design system for NIYOJAK demo app */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* =========================================================================
+   Design tokens
+   ========================================================================= */
+
+:root {
+  --bg-base:        #0a0d14;
+  --bg-surface:     #111520;
+  --bg-elevated:    #161b2e;
+  --bg-glass:       rgba(22, 27, 46, 0.7);
+
+  --border:         rgba(255, 255, 255, 0.07);
+  --border-active:  rgba(99, 179, 237, 0.35);
+
+  --text-primary:   #f0f4ff;
+  --text-secondary: #8892a4;
+  --text-muted:     #4a5568;
+
+  --accent:         #5b8dee;
+  --accent-glow:    rgba(91, 141, 238, 0.25);
+
+  --green:          #48bb78;
+  --green-dim:      rgba(72, 187, 120, 0.15);
+  --yellow:         #ecc94b;
+  --yellow-dim:     rgba(236, 201, 75, 0.15);
+  --red:            #fc5c65;
+  --red-dim:        rgba(252, 92, 101, 0.15);
+
+  --radius-sm:      6px;
+  --radius-md:      12px;
+  --radius-lg:      18px;
+
+  --shadow-card:    0 4px 24px rgba(0, 0, 0, 0.4);
+  --shadow-glow:    0 0 32px var(--accent-glow);
+
+  --transition:     all 0.18s ease;
+}
+
+/* =========================================================================
+   Reset
+   ========================================================================= */
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { font-size: 16px; scroll-behavior: smooth; }
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  min-height: 100vh;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* =========================================================================
+   Background grid pattern
+   ========================================================================= */
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(91, 141, 238, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(91, 141, 238, 0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* =========================================================================
+   Typography
+   ========================================================================= */
+
+h1 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.03em; }
+h2 { font-size: 1.25rem; font-weight: 600; letter-spacing: -0.02em; }
+h3 { font-size: 1rem;    font-weight: 600; }
+
+code, .mono {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+}
+
+/* =========================================================================
+   Layout
+   ========================================================================= */
+
+.container {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  position: relative;
+  z-index: 1;
+}
+
+.container--wide {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  position: relative;
+  z-index: 1;
+}
+
+/* =========================================================================
+   Header
+   ========================================================================= */
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1.25rem 2rem;
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.header__logo {
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+  text-decoration: none;
+}
+
+.header__nav { display: flex; gap: 1.5rem; }
+
+.header__nav a {
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: var(--transition);
+}
+
+.header__nav a:hover,
+.header__nav a.active { color: var(--text-primary); }
+
+/* =========================================================================
+   Card
+   ========================================================================= */
+
+.card {
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+  box-shadow: var(--shadow-card);
+  transition: var(--transition);
+}
+
+.card:hover {
+  border-color: var(--border-active);
+  box-shadow: var(--shadow-card), var(--shadow-glow);
+}
+
+/* =========================================================================
+   Buttons
+   ========================================================================= */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1.25rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  font-size: 0.875rem;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  transition: var(--transition);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.btn--primary {
+  background: var(--accent);
+  color: #fff;
+}
+.btn--primary:hover { filter: brightness(1.15); }
+
+.btn--danger {
+  background: var(--red-dim);
+  color: var(--red);
+  border-color: rgba(252, 92, 101, 0.3);
+}
+.btn--danger:hover { background: rgba(252, 92, 101, 0.25); }
+
+.btn--warning {
+  background: var(--yellow-dim);
+  color: var(--yellow);
+  border-color: rgba(236, 201, 75, 0.3);
+}
+.btn--warning:hover { background: rgba(236, 201, 75, 0.25); }
+
+.btn--success {
+  background: var(--green-dim);
+  color: var(--green);
+  border-color: rgba(72, 187, 120, 0.3);
+}
+.btn--success:hover { background: rgba(72, 187, 120, 0.25); }
+
+.btn--ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+.btn--ghost:hover { color: var(--text-primary); border-color: var(--border-active); }
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  filter: none;
+}
+
+/* =========================================================================
+   Score badge
+   ========================================================================= */
+
+.score-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  font-weight: 700;
+  font-size: 0.9rem;
+  border: 2px solid transparent;
+}
+
+.score-badge--high  { background: var(--green-dim);  color: var(--green);  border-color: rgba(72,187,120,0.4); }
+.score-badge--mid   { background: var(--yellow-dim); color: var(--yellow); border-color: rgba(236,201,75,0.4); }
+.score-badge--low   { background: var(--red-dim);    color: var(--red);    border-color: rgba(252,92,101,0.4); }
+
+/* =========================================================================
+   Progress bar
+   ========================================================================= */
+
+.progress {
+  height: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.progress__bar {
+  height: 100%;
+  border-radius: 99px;
+  transition: width 0.4s ease;
+}
+
+.progress__bar--green  { background: var(--green); }
+.progress__bar--yellow { background: var(--yellow); }
+.progress__bar--red    { background: var(--red); }
+
+/* =========================================================================
+   Status dot
+   ========================================================================= */
+
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot--green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+.dot--yellow { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }
+.dot--red    { background: var(--red);    box-shadow: 0 0 6px var(--red); }
+.dot--pulse  { animation: pulse 1.5s infinite; }
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+/* =========================================================================
+   Tag / chip
+   ========================================================================= */
+
+.tag {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 99px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+
+.tag--green  { background: var(--green-dim);  color: var(--green); }
+.tag--yellow { background: var(--yellow-dim); color: var(--yellow); }
+.tag--red    { background: var(--red-dim);    color: var(--red); }
+.tag--blue   { background: var(--accent-glow); color: var(--accent); }
+
+/* =========================================================================
+   Form elements
+   ========================================================================= */
+
+.input {
+  width: 100%;
+  padding: 0.6rem 1rem;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 0.9rem;
+  transition: var(--transition);
+  outline: none;
+}
+
+.input:focus {
+  border-color: var(--accent);
+  background: rgba(91, 141, 238, 0.06);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+.input::placeholder { color: var(--text-muted); }
+
+/* =========================================================================
+   Grid helpers
+   ========================================================================= */
+
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1.25rem; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.25rem; }
+
+@media (max-width: 768px) {
+  .grid-3, .grid-2 { grid-template-columns: 1fr; }
+}
+
+/* =========================================================================
+   Utility
+   ========================================================================= */
+
+.flex         { display: flex; }
+.flex-center  { display: flex; align-items: center; }
+.flex-between { display: flex; align-items: center; justify-content: space-between; }
+.gap-sm       { gap: 0.5rem; }
+.gap-md       { gap: 1rem; }
+.gap-lg       { gap: 1.5rem; }
+.mt-sm        { margin-top: 0.5rem; }
+.mt-md        { margin-top: 1rem; }
+.mt-lg        { margin-top: 1.5rem; }
+.text-muted   { color: var(--text-secondary); }
+.text-sm      { font-size: 0.875rem; }
+.text-xs      { font-size: 0.75rem; }
+.font-mono    { font-family: 'JetBrains Mono', monospace; }

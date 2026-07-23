@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NIYOJAK — Admin Control Portal</title>
+  <meta name="description" content="Live cluster control portal for the NIYOJAK AI Kubernetes Scheduler demo." />
+  <link rel="stylesheet" href="/styles.css" />
+  <style>
+    /* Admin-specific layout */
+    .admin-hero {
+      padding: 2rem 0 1.5rem;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2rem;
+    }
+    .admin-hero__meta {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-top: 0.5rem;
+      font-size: 0.85rem;
+      color: var(--text-secondary);
+    }
+
+    /* Node cards */
+    .node-card { position: relative; }
+    .node-card__header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1.25rem;
+    }
+    .node-card__name {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .node-card__role {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .node-card__metric {
+      margin-bottom: 0.9rem;
+    }
+    .node-card__metric-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      margin-bottom: 0.35rem;
+    }
+    .node-card__metric-val { font-weight: 600; }
+    .node-card__actions {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 1.25rem;
+    }
+    .node-card__actions-row {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .node-card__actions-row .btn { flex: 1; font-size: 0.8rem; padding: 0.4rem 0.75rem; }
+    .node-card__actions select {
+      width: 100%;
+      padding: 0.4rem 0.75rem;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 0.8rem;
+      cursor: pointer;
+      outline: none;
+    }
+    .node-card__actions select:focus { border-color: var(--accent); }
+    .stress-countdown {
+      font-size: 0.72rem;
+      color: var(--yellow);
+      font-family: 'JetBrains Mono', monospace;
+      margin-top: 0.3rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .node-card--stressed { border-color: rgba(252, 92, 101, 0.4) !important; }
+    .node-card--stressed::before {
+      content: 'STRESSED';
+      position: absolute;
+      top: 0.75rem;
+      right: 0.75rem;
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--red);
+      background: var(--red-dim);
+      padding: 0.15rem 0.5rem;
+      border-radius: 99px;
+    }
+
+    /* Flood control */
+    .flood-panel {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      align-items: start;
+    }
+    .flood-stats {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin-top: 1rem;
+    }
+    .stat-box {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 0.85rem 1rem;
+    }
+    .stat-box__val {
+      font-size: 1.5rem;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1;
+    }
+    .stat-box__label {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      margin-top: 0.35rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .flood-active-indicator {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8rem;
+      color: var(--yellow);
+      margin-top: 0.75rem;
+    }
+
+    /* Pod map */
+    .pod-map { margin-top: 0.5rem; }
+    .pod-map__node-group { margin-bottom: 1rem; }
+    .pod-map__node-label {
+      font-size: 0.78rem;
+      color: var(--text-secondary);
+      margin-bottom: 0.5rem;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .pod-map__pods { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+    .pod-chip {
+      display: inline-block;
+      padding: 0.25rem 0.6rem;
+      border-radius: 99px;
+      font-size: 0.72rem;
+      font-family: 'JetBrains Mono', monospace;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,0.03);
+      color: var(--text-secondary);
+      transition: var(--transition);
+    }
+    .pod-chip--ready { border-color: rgba(72,187,120,0.3); color: var(--green); }
+    .pod-chip--new   {
+      animation: pop-in 0.4s ease;
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    @keyframes pop-in {
+      from { transform: scale(0.7); opacity: 0; }
+      to   { transform: scale(1);   opacity: 1; }
+    }
+
+    /* Connection status */
+    .conn-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.75rem;
+      padding: 0.2rem 0.65rem;
+      border-radius: 99px;
+      background: var(--green-dim);
+      color: var(--green);
+      border: 1px solid rgba(72,187,120,0.3);
+    }
+    .conn-badge--disconnected {
+      background: var(--red-dim);
+      color: var(--red);
+      border-color: rgba(252,92,101,0.3);
+    }
+
+    /* Section title */
+    .section-title {
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a class="header__logo" href="/">NIYOJAK</a>
+    <nav class="header__nav">
+      <a href="/">To-Do</a>
+      <a href="/admin" class="active">Admin</a>
+    </nav>
+  </header>
+
+  <main class="container--wide">
+
+    <!-- Hero -->
+    <div class="admin-hero">
+      <h1>Control Portal</h1>
+      <div class="admin-hero__meta">
+        <span id="conn-status" class="conn-badge">
+          <span class="dot dot--green dot--pulse"></span>
+          Live
+        </span>
+        <span id="last-update" class="text-muted text-xs">Connecting...</span>
+        <span class="text-muted text-xs">|</span>
+        <span id="todo-count" class="text-muted text-xs">Tasks: —</span>
+      </div>
+    </div>
+
+    <!-- Node Status Cards -->
+    <p class="section-title">Node Status — AI Placement Scores</p>
+    <div class="grid-3" id="node-grid">
+      <!-- Populated by admin.js -->
+      <div class="card" style="opacity:0.4;text-align:center;padding:2rem">
+        <p class="text-muted text-sm">Waiting for cluster data...</p>
+      </div>
+    </div>
+
+    <!-- Flood Control + Pod Map -->
+    <div class="grid-2 mt-lg">
+
+      <!-- Flood Control -->
+      <div class="card">
+        <p class="section-title">Traffic Flood Control</p>
+        <p class="text-muted text-sm" style="margin-bottom:1.25rem">
+          Fires concurrent HTTP requests at this app to drive CPU load.
+          When CPU exceeds the HPA threshold, Kubernetes creates new pods
+          which niyojak-scheduler places on the healthiest node.
+        </p>
+
+        <div class="flood-panel">
+          <div>
+            <label class="text-xs text-muted" for="rps-input">Requests / second</label>
+            <input class="input mt-sm" id="rps-input" type="number" value="200" min="10" max="2000" />
+          </div>
+          <div>
+            <label class="text-xs text-muted" for="conc-input">Concurrency</label>
+            <input class="input mt-sm" id="conc-input" type="number" value="30" min="1" max="200" />
+          </div>
+        </div>
+
+        <div class="flex gap-sm mt-md">
+          <button class="btn btn--warning" id="flood-start-btn">Flood Requests</button>
+          <button class="btn btn--ghost" id="flood-stop-btn" disabled>Stop Flood</button>
+        </div>
+
+        <div id="flood-active-bar" class="flood-active-indicator" style="display:none">
+          <span class="dot dot--yellow dot--pulse"></span>
+          Flood active — HPA will scale pods shortly
+        </div>
+
+        <div class="flood-stats" id="flood-stats" style="display:none">
+          <div class="stat-box">
+            <div class="stat-box__val" id="stat-sent">0</div>
+            <div class="stat-box__label">Sent</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box__val" id="stat-rps">0</div>
+            <div class="stat-box__label">Actual RPS</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box__val" id="stat-ok">0</div>
+            <div class="stat-box__label">Success</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-box__val" id="stat-err">0</div>
+            <div class="stat-box__label">Failed</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Pod Placement Map -->
+      <div class="card">
+        <p class="section-title">Pod Placement Map</p>
+        <p class="text-muted text-sm" style="margin-bottom:1.25rem">
+          Live view of which To-Do App pod is running on which node.
+          New pods scheduled by niyojak-scheduler appear here in real time.
+        </p>
+        <div class="pod-map" id="pod-map">
+          <p class="text-muted text-sm">No pods detected yet.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <div style="height:2rem"></div>
+  </main>
+
+  <script src="/admin.js"></script>
+</body>
+</html>

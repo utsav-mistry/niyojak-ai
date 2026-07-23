@@ -1,0 +1,144 @@
+---
+# Deployment for the niyojak To-Do App.
+# All pods use schedulerName: niyojak-scheduler so every new replica
+# is placed by the AI-powered scheduler, not the default kube-scheduler.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-app
+  namespace: default
+  labels:
+    app: todo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: todo-app
+  template:
+    metadata:
+      labels:
+        app: todo-app
+    spec:
+      # This is the key line — opt into niyojak AI scheduling.
+      schedulerName: niyojak-scheduler
+
+      serviceAccountName: todo-app
+      containers:
+        - name: todo-app
+          image: ghcr.io/niyojak/niyojak-todo-app:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: AI_SERVICE_URL
+              value: "http://niyojak-aiservice.niyojak-system.svc.cluster.local:8000"
+            - name: NIYOJAK_NAMESPACE
+              value: "niyojak-system"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: db-storage
+              mountPath: /data
+      volumes:
+        - name: db-storage
+          emptyDir: {}
+
+---
+# Service — exposes the To-Do App within the cluster and optionally via NodePort.
+apiVersion: v1
+kind: Service
+metadata:
+  name: todo-app
+  namespace: default
+  labels:
+    app: todo-app
+spec:
+  selector:
+    app: todo-app
+  ports:
+    - port: 80
+      targetPort: 3000
+      # NodePort lets you access the app from outside the cluster
+      # on http://<NODE1_IP>:30080 without an Ingress controller.
+      nodePort: 30080
+  type: NodePort
+
+---
+# HPA — Horizontal Pod Autoscaler.
+# When average CPU across all todo-app pods exceeds 50%, K8s requests new replicas.
+# Those new pods are scheduled by niyojak-scheduler based on AI node scores.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: todo-app-hpa
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: todo-app
+  minReplicas: 2
+  maxReplicas: 15
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50
+
+---
+# ServiceAccount for the To-Do App.
+# Needs permission to create/delete Jobs (for stress_controller.js)
+# and to list pods (for the pod placement map).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: todo-app
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: todo-app
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: todo-app
+subjects:
+  - kind: ServiceAccount
+    name: todo-app
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: todo-app
