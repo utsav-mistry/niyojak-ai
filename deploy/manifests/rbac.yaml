@@ -36,6 +36,14 @@ rules:
     resources: ["pods/binding"]
     verbs: ["create"]
 
+  # Patch pod status to mark Unschedulable when no nodes pass the filter.
+  # Without this, pods that violate nodeAffinity stay in plain Pending
+  # indefinitely, and the Deployment controller keeps spawning replacements
+  # (the pod storm). This mirrors what kube-scheduler does natively.
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["patch", "update"]
+
   # Read node capacity, allocatable resources, and taint information
   - apiGroups: [""]
     resources: ["nodes"]

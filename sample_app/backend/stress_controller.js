@@ -111,7 +111,9 @@ async function stressNode(nodeName, profile = "light") {
               args: [
                 `--cpu=${config.cpu}`,
                 `--mem=${config.mem_mb}`,
-                `--duration=${effectiveDuration}s`,
+                // NOTE: saturate's --duration flag is a plain int (seconds).
+                // Do NOT append "s" — Go's flag package cannot parse "180s" as int.
+                `--duration=${effectiveDuration}`,
               ],
               resources: {
                 requests: { cpu: "100m", memory: "64Mi" },
