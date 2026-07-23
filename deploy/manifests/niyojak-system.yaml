@@ -30,7 +30,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
         - name: scheduler
-          image: ghcr.io/niyojak/niyojak-scheduler:latest
+          image: utsavmistry/niyojak-scheduler:latest
           imagePullPolicy: Always
           args:
             - --ai-endpoint=http://niyojak-aiservice:8000/score
@@ -78,7 +78,7 @@ spec:
         node-role.kubernetes.io/control-plane: "true"
       containers:
         - name: aiservice
-          image: ghcr.io/niyojak/niyojak-aiservice:latest
+          image: utsavmistry/niyojak-aiservice:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 8000

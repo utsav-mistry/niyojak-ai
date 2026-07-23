@@ -25,7 +25,7 @@ spec:
       serviceAccountName: todo-app
       containers:
         - name: todo-app
-          image: ghcr.io/niyojak/niyojak-todo-app:latest
+          image: utsavmistry/niyojak-todo-app:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
