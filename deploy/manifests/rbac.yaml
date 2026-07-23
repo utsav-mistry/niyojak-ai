@@ -1,0 +1,61 @@
+---
+# niyojak-system namespace — isolates all scheduler components
+# from user workloads.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: niyojak-system
+  labels:
+    app.kubernetes.io/managed-by: niyojak
+
+---
+# ServiceAccount used by niyojak-scheduler when running as a pod.
+# The in-cluster config reads the token from:
+#   /var/run/secrets/kubernetes.io/serviceaccount/token
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: niyojak-scheduler
+  namespace: niyojak-system
+
+---
+# ClusterRole — minimum permissions required by niyojak-scheduler.
+# Read pods and nodes, create bindings (place pods), create events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: niyojak-scheduler
+rules:
+  # Watch for pending pods across all namespaces
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # Bind a pod to a node (the core scheduling action)
+  - apiGroups: [""]
+    resources: ["pods/binding"]
+    verbs: ["create"]
+
+  # Read node capacity, allocatable resources, and taint information
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+  # Emit scheduling events visible in kubectl describe pod
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: niyojak-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: niyojak-scheduler
+    namespace: niyojak-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: niyojak-scheduler

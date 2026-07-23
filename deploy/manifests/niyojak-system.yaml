@@ -1,0 +1,129 @@
+---
+# niyojak-scheduler Deployment.
+# Runs as a single replica alongside the default k3s/kube-scheduler.
+# Only pods that set schedulerName: niyojak-scheduler are handled here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: niyojak-scheduler
+  namespace: niyojak-system
+  labels:
+    app: niyojak-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: niyojak-scheduler
+  template:
+    metadata:
+      labels:
+        app: niyojak-scheduler
+    spec:
+      serviceAccountName: niyojak-scheduler
+      # Pin to the control-plane node so the scheduler is always available
+      # even when worker nodes are under stress.
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: scheduler
+          image: ghcr.io/niyojak/niyojak-scheduler:latest
+          imagePullPolicy: Always
+          args:
+            - --ai-endpoint=http://niyojak-aiservice:8000/score
+            - --v=2
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          livenessProbe:
+            # The scheduler does not expose HTTP — use a process check.
+            exec:
+              command: ["/bin/sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+
+---
+# niyojak-aiservice Deployment.
+# Python FastAPI inference engine. Polls Prometheus for node telemetry
+# and serves POST /score responses to the scheduler in under 10ms.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: niyojak-aiservice
+  namespace: niyojak-system
+  labels:
+    app: niyojak-aiservice
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: niyojak-aiservice
+  template:
+    metadata:
+      labels:
+        app: niyojak-aiservice
+    spec:
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: aiservice
+          image: ghcr.io/niyojak/niyojak-aiservice:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PROMETHEUS_URL
+              value: "http://prometheus.niyojak-system.svc.cluster.local:9090"
+            - name: POLL_INTERVAL_SEC
+              value: "5"
+            - name: WINDOW_SIZE
+              value: "12"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+
+---
+# Service for niyojak-aiservice.
+# The scheduler connects to this via http://niyojak-aiservice:8000/score
+# (short DNS name works because both are in niyojak-system namespace).
+apiVersion: v1
+kind: Service
+metadata:
+  name: niyojak-aiservice
+  namespace: niyojak-system
+  labels:
+    app: niyojak-aiservice
+spec:
+  selector:
+    app: niyojak-aiservice
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
