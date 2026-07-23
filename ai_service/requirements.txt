@@ -1,0 +1,9 @@
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+pydantic==2.6.1
+xgboost==2.0.3
+scikit-learn==1.4.0
+numpy==1.26.4
+pandas==2.2.0
+requests==2.31.0
+prometheus-client==0.20.0
