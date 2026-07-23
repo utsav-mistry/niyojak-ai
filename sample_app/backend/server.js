@@ -37,9 +37,20 @@ const AI_SERVICE_URL = process.env.AI_SERVICE_URL || "http://niyojak-aiservice:8
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 // Kubernetes client for pod listing (pod placement map).
-const kc = new k8s.KubeConfig();
-kc.loadFromDefault();
-const coreApi = kc.makeApiClient(k8s.CoreV1Api);
+// Initialize lazily so the app can still start in local/light environments.
+let coreApi = null;
+
+function getCoreApi() {
+  if (coreApi) return coreApi;
+  try {
+    const kc = new k8s.KubeConfig();
+    kc.loadFromDefault();
+    coreApi = kc.makeApiClient(k8s.CoreV1Api);
+    return coreApi;
+  } catch (_) {
+    return null;
+  }
+}
 
 app.use(express.json());
 
@@ -94,35 +105,38 @@ async function fetchStatus() {
   try {
     const r = await fetch(`${AI_SERVICE_URL}/nodes`, { signal: AbortSignal.timeout(3000) });
     if (r.ok) nodes = await r.json();
-  } catch (_) {}
+  } catch (_) { }
 
   // Pod placement map
   let pods = [];
   try {
-    const res = await coreApi.listPodForAllNamespaces(
-      undefined, undefined, undefined, "app=todo-app"
-    );
-    pods = res.body.items.map((p) => ({
-      name:      p.metadata.name,
-      namespace: p.metadata.namespace,
-      nodeName:  p.spec.nodeName || "pending",
-      phase:     p.status.phase,
-      ready:     (p.status.containerStatuses || []).some((c) => c.ready),
-    }));
-  } catch (_) {}
+    const api = getCoreApi();
+    if (api) {
+      const res = await api.listPodForAllNamespaces(
+        undefined, undefined, undefined, "app=todo-app"
+      );
+      pods = res.body.items.map((p) => ({
+        name: p.metadata.name,
+        namespace: p.metadata.namespace,
+        nodeName: p.spec.nodeName || "pending",
+        phase: p.status.phase,
+        ready: (p.status.containerStatuses || []).some((c) => c.ready),
+      }));
+    }
+  } catch (_) { }
 
   // Active stress jobs with profile info and countdown
   let stressJobs = [];
   try {
     stressJobs = await stress.activeStressJobs();
-  } catch (_) {}
+  } catch (_) { }
 
   return {
     nodes,
     pods,
     stressJobs,                                          // full job info for countdown
     stressedNodes: stressJobs.map(j => j.nodeName),     // backward-compat flat list
-    flood:     flood.getStats(),
+    flood: flood.getStats(),
     todoCount: db.todoCount(),
     ts: Date.now(),
   };
@@ -205,7 +219,7 @@ setInterval(async () => {
     for (const client of sseClients) {
       client.write(data);
     }
-  } catch (_) {}
+  } catch (_) { }
 }, 2000);
 
 // ---------------------------------------------------------------------------

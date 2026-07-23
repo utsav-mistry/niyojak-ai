@@ -60,7 +60,24 @@ spec:
               mountPath: /data
       volumes:
         - name: db-storage
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: todo-app-data
+
+---
+# Shared PVC for lightweight todo persistence across pod restarts.
+# For multi-pod demos, this should be backed by a storage class that supports
+# shared access. If your cluster lacks that, keep the app at a single replica.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: todo-app-data
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 1Gi
 
 ---
 # Service — exposes the To-Do App within the cluster and optionally via NodePort.

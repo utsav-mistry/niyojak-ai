@@ -1,75 +1,99 @@
 "use strict";
 
 /**
- * db.js — SQLite database driver with automatic schema initialisation.
+ * db.js — lightweight file-backed todo store.
  *
- * Uses better-sqlite3 (synchronous) so there is no callback complexity.
- * On every startup it creates tasks.db and the todos table if they do not
- * exist yet — no manual database setup is ever needed.
+ * This avoids native database bindings while still retaining state across
+ * restarts and, when backed by a shared Kubernetes volume, across pods.
  */
 
+const fs = require("fs");
 const path = require("path");
-const Database = require("better-sqlite3");
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, "..", "tasks.db");
+const DB_PATH = process.env.DB_PATH || "/data/tasks.json";
+let state = { todos: [], nextId: 1 };
+let loaded = false;
 
-let db;
+function ensureStore() {
+  if (loaded) return;
 
-function getDb() {
-  if (!db) {
-    db = new Database(DB_PATH);
-
-    // Enable WAL mode for better read concurrency under load.
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
-
-    // Auto-create schema on first run.
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS todos (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        title      TEXT    NOT NULL,
-        done       INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT    NOT NULL DEFAULT (datetime('now'))
-      );
-    `);
+  const dir = path.dirname(DB_PATH);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
-  return db;
+
+  if (fs.existsSync(DB_PATH)) {
+    try {
+      const raw = fs.readFileSync(DB_PATH, "utf8");
+      if (raw.trim()) {
+        const parsed = JSON.parse(raw);
+        state = {
+          todos: Array.isArray(parsed.todos) ? parsed.todos : [],
+          nextId: typeof parsed.nextId === "number" ? parsed.nextId : 1,
+        };
+      }
+    } catch (_) {
+      state = { todos: [], nextId: 1 };
+    }
+  } else {
+    writeState();
+  }
+
+  loaded = true;
 }
 
-// --- Prepared statements (compiled once, reused across requests) ----------
+function writeState() {
+  const tmpPath = `${DB_PATH}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2));
+  fs.renameSync(tmpPath, DB_PATH);
+}
 
 function listTodos() {
-  return getDb()
-    .prepare("SELECT id, title, done, created_at FROM todos ORDER BY id DESC")
-    .all();
+  ensureStore();
+  return [...state.todos].sort((a, b) => b.id - a.id);
 }
 
 function getTodo(id) {
-  return getDb()
-    .prepare("SELECT id, title, done, created_at FROM todos WHERE id = ?")
-    .get(id);
+  ensureStore();
+  return state.todos.find((todo) => todo.id === id) || null;
 }
 
 function createTodo(title) {
-  const result = getDb()
-    .prepare("INSERT INTO todos (title) VALUES (?)")
-    .run(title);
-  return getTodo(result.lastInsertRowid);
+  ensureStore();
+  const todo = {
+    id: state.nextId++,
+    title,
+    done: 0,
+    created_at: new Date().toISOString(),
+  };
+  state.todos.push(todo);
+  writeState();
+  return todo;
 }
 
 function updateTodo(id, { title, done }) {
-  getDb()
-    .prepare("UPDATE todos SET title = ?, done = ? WHERE id = ?")
-    .run(title, done ? 1 : 0, id);
-  return getTodo(id);
+  ensureStore();
+  const existing = getTodo(id);
+  if (!existing) return null;
+
+  existing.title = title ?? existing.title;
+  existing.done = done ?? existing.done;
+  writeState();
+  return existing;
 }
 
 function deleteTodo(id) {
-  getDb().prepare("DELETE FROM todos WHERE id = ?").run(id);
+  ensureStore();
+  const idx = state.todos.findIndex((todo) => todo.id === id);
+  if (idx >= 0) {
+    state.todos.splice(idx, 1);
+    writeState();
+  }
 }
 
 function todoCount() {
-  return getDb().prepare("SELECT COUNT(*) as n FROM todos").get().n;
+  ensureStore();
+  return state.todos.length;
 }
 
 module.exports = { listTodos, getTodo, createTodo, updateTodo, deleteTodo, todoCount };
