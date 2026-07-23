@@ -10,10 +10,19 @@ metadata:
   labels:
     app: todo-app
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: todo-app
+  # Strict rollout limits to prevent pod-storm loops.
+  # maxSurge: 1  — only one extra pod can exist above the desired count at a time.
+  # maxUnavailable: 0  — keep all desired pods running; never allow an empty slot
+  #                      that the deployment controller would try to fill aggressively.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
@@ -107,8 +116,8 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: todo-app
-  minReplicas: 2
-  maxReplicas: 15
+  minReplicas: 1
+  maxReplicas: 10
   metrics:
     - type: Resource
       resource:
