@@ -17,7 +17,7 @@
 const k8s = require("@kubernetes/client-node");
 
 const NAMESPACE = process.env.NIYOJAK_NAMESPACE || "niyojak-system";
-const SATURATE_IMAGE = process.env.SATURATE_IMAGE || "ghcr.io/niyojak/niyojak-saturate:latest";
+const SATURATE_IMAGE = process.env.SATURATE_IMAGE || "utsavmistry/niyojak-saturate:latest";
 const SAFE_STRESS_MODE = process.env.NIYOJAK_SAFE_STRESS_MODE !== "false";
 
 // Hard ceiling on how long any stress Job can run — Kubernetes enforces this
