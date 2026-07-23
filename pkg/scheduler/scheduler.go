@@ -18,6 +18,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -94,6 +95,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 func (s *Scheduler) schedule(ctx context.Context, pod *v1.Pod) error {
 	klog.V(2).Infof("[niyojak] scheduling pod %s/%s", pod.Namespace, pod.Name)
 
+	if pvcNames := podPVCNames(pod); len(pvcNames) > 0 {
+		message := fmt.Sprintf(
+			"pod uses PVC-backed volumes (%s). niyojak-scheduler binds pods directly, so StorageClasses with WaitForFirstConsumer can deadlock; prefer emptyDir or an immediate-binding StorageClass",
+			strings.Join(pvcNames, ", "),
+		)
+		klog.Warningf("[niyojak] %s/%s: %s", pod.Namespace, pod.Name, message)
+		s.binder.EmitWarningEvent(ctx, pod, message)
+	}
+
 	// 1. List all nodes that are Ready and not marked unschedulable.
 	nodes, err := s.readyNodes(ctx)
 	if err != nil {
@@ -157,4 +167,19 @@ func isNodeReady(node *v1.Node) bool {
 		}
 	}
 	return false
+}
+
+// podPVCNames returns the names of PVC-backed volumes used by pod.
+func podPVCNames(pod *v1.Pod) []string {
+	var pvcNames []string
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			claimName := volume.PersistentVolumeClaim.ClaimName
+			if claimName == "" {
+				claimName = volume.Name
+			}
+			pvcNames = append(pvcNames, claimName)
+		}
+	}
+	return pvcNames
 }

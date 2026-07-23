@@ -78,3 +78,31 @@ func (b *Binder) EmitEvent(ctx context.Context, pod *v1.Pod, nodeName string, sc
 		klog.Warningf("[niyojak] could not emit scheduling event for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
 }
+
+// EmitWarningEvent writes a Kubernetes Warning Event on the pod.
+// This is used for non-fatal scheduling problems that need operator visibility.
+func (b *Binder) EmitWarningEvent(ctx context.Context, pod *v1.Pod, message string) {
+	event := &v1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.niyojak-warning", pod.Name),
+			Namespace: pod.Namespace,
+		},
+		InvolvedObject: v1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Name:       pod.Name,
+			Namespace:  pod.Namespace,
+			UID:        pod.UID,
+		},
+		Reason:         "PVCBindingRisk",
+		Message:        message,
+		Source:         v1.EventSource{Component: SchedulerName},
+		Type:           v1.EventTypeWarning,
+		FirstTimestamp: metav1.Now(),
+		LastTimestamp:  metav1.Now(),
+	}
+
+	if _, err := b.client.CoreV1().Events(pod.Namespace).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+		klog.Warningf("[niyojak] could not emit PVC warning event for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+}
