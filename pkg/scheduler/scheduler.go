@@ -9,18 +9,21 @@
 // Scheduling loop:
 //  1. Watch pods where spec.schedulerName == "niyojak-scheduler" and spec.nodeName == ""
 //  2. List all Ready nodes
-//  3. Filter nodes: taint/toleration check + resource capacity check
-//  4. POST each eligible (pod, node) to the AI service for a placement score (0-100)
-//  5. Bind the pod to the highest-scoring node via the K8s Binding API
-//  6. Emit a Kubernetes Event recording which node was chosen and its AI score
+//  3. Filter nodes: taint/toleration + nodeAffinity + resource capacity check
+//  4. If no nodes pass: mark pod Unschedulable (PodCondition + FailedScheduling event) and stop
+//  5. POST each eligible (pod, node) to the AI service for a placement score (0-100)
+//  6. Bind the pod to the highest-scoring node via the K8s Binding API
+//  7. Emit a Kubernetes Event recording which node was chosen and its AI score
 package scheduler
 
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -94,6 +97,15 @@ func (s *Scheduler) Run(ctx context.Context) error {
 func (s *Scheduler) schedule(ctx context.Context, pod *v1.Pod) error {
 	klog.V(2).Infof("[niyojak] scheduling pod %s/%s", pod.Namespace, pod.Name)
 
+	if pvcNames := podPVCNames(pod); len(pvcNames) > 0 {
+		message := fmt.Sprintf(
+			"pod uses PVC-backed volumes (%s). niyojak-scheduler binds pods directly, so StorageClasses with WaitForFirstConsumer can deadlock; prefer emptyDir or an immediate-binding StorageClass",
+			strings.Join(pvcNames, ", "),
+		)
+		klog.Warningf("[niyojak] %s/%s: %s", pod.Namespace, pod.Name, message)
+		s.binder.EmitWarningEvent(ctx, pod, message)
+	}
+
 	// 1. List all nodes that are Ready and not marked unschedulable.
 	nodes, err := s.readyNodes(ctx)
 	if err != nil {
@@ -103,10 +115,19 @@ func (s *Scheduler) schedule(ctx context.Context, pod *v1.Pod) error {
 		return fmt.Errorf("no schedulable nodes in cluster")
 	}
 
-	// 2. Filter: remove nodes the pod cannot run on (taints, resource capacity).
+	// 2. Filter: remove nodes the pod cannot run on (taints, nodeAffinity, resource capacity).
 	eligible := FilterNodes(pod, nodes)
 	if len(eligible) == 0 {
-		return fmt.Errorf("pod %s/%s: no nodes passed taint/capacity filter", pod.Namespace, pod.Name)
+		// No nodes passed the filter. Mark the pod Unschedulable so the
+		// Deployment controller and HPA stop spawning replacements.
+		// Without this, the pod stays in plain Pending and the controllers
+		// keep creating new replicas trying to fill the gap — the pod storm.
+		msg := fmt.Sprintf(
+			"0/%d nodes are available: node affinity / taint / capacity constraints are not satisfiable",
+			len(nodes),
+		)
+		s.markUnschedulable(ctx, pod, msg)
+		return fmt.Errorf("pod %s/%s: no nodes passed filter — marked Unschedulable", pod.Namespace, pod.Name)
 	}
 	klog.V(3).Infof("[niyojak] pod %s/%s: %d/%d nodes eligible after filter",
 		pod.Namespace, pod.Name, len(eligible), len(nodes))
@@ -128,6 +149,63 @@ func (s *Scheduler) schedule(ctx context.Context, pod *v1.Pod) error {
 	klog.Infof("[niyojak] scheduled %s/%s -> %s (AI score: %d/100)",
 		pod.Namespace, pod.Name, bestNode, score)
 	return nil
+}
+
+// markUnschedulable patches the pod's PodScheduled condition to False/Unschedulable
+// and emits a FailedScheduling event — exactly what kube-scheduler does when it
+// cannot place a pod. This is critical: without it, pods that will never be
+// schedulable stay in plain Pending, and the Deployment controller keeps creating
+// replacement pods thinking the previous ones are just slow to start.
+func (s *Scheduler) markUnschedulable(ctx context.Context, pod *v1.Pod, reason string) {
+	// 1. Patch the pod's condition so kubectl and controllers see it properly.
+	now := metav1.Now()
+	condition := v1.PodCondition{
+		Type:               v1.PodScheduled,
+		Status:             v1.ConditionFalse,
+		Reason:             "Unschedulable",
+		Message:            reason,
+		LastTransitionTime: now,
+	}
+
+	// Build a minimal JSON patch for the pod status condition.
+	patch := fmt.Sprintf(
+		`{"status":{"conditions":[{"type":"PodScheduled","status":"False","reason":"Unschedulable","message":%q,"lastTransitionTime":%q}]}}`,
+		condition.Message,
+		now.UTC().Format("2006-01-02T15:04:05Z"),
+	)
+	_, err := s.client.CoreV1().Pods(pod.Namespace).Patch(
+		ctx, pod.Name, types.MergePatchType, []byte(patch),
+		metav1.PatchOptions{}, "status",
+	)
+	if err != nil {
+		klog.Warningf("[niyojak] could not patch Unschedulable condition on pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+
+	// 2. Emit a FailedScheduling event so `kubectl describe pod` shows why.
+	event := &v1.Event{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s.niyojak-failedscheduling", pod.Name),
+			Namespace: pod.Namespace,
+		},
+		InvolvedObject: v1.ObjectReference{
+			APIVersion: "v1",
+			Kind:       "Pod",
+			Name:       pod.Name,
+			Namespace:  pod.Namespace,
+			UID:        pod.UID,
+		},
+		Reason:         "FailedScheduling",
+		Message:        reason,
+		Source:         v1.EventSource{Component: SchedulerName},
+		Type:           v1.EventTypeWarning,
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+	}
+	if _, err := s.client.CoreV1().Events(pod.Namespace).Create(ctx, event, metav1.CreateOptions{}); err != nil {
+		klog.Warningf("[niyojak] could not emit FailedScheduling event for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+
+	klog.Warningf("[niyojak] pod %s/%s marked Unschedulable: %s", pod.Namespace, pod.Name, reason)
 }
 
 // readyNodes lists all nodes that are Ready and not explicitly unschedulable.
@@ -157,4 +235,19 @@ func isNodeReady(node *v1.Node) bool {
 		}
 	}
 	return false
+}
+
+// podPVCNames returns the names of PVC-backed volumes used by pod.
+func podPVCNames(pod *v1.Pod) []string {
+	var pvcNames []string
+	for _, volume := range pod.Spec.Volumes {
+		if volume.PersistentVolumeClaim != nil {
+			claimName := volume.PersistentVolumeClaim.ClaimName
+			if claimName == "" {
+				claimName = volume.Name
+			}
+			pvcNames = append(pvcNames, claimName)
+		}
+	}
+	return pvcNames
 }

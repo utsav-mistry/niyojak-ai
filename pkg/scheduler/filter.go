@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"strconv"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
@@ -9,20 +11,29 @@ import (
 //
 // Before calling the AI service we eliminate nodes that cannot physically
 // host the pod. This mirrors the Filter stage of the kube-scheduler:
-// we check taints/tolerations and basic resource fit.
+// we check taints/tolerations, node affinity, and basic resource fit.
 //
 // Nodes that pass all checks here are sent to the AI scorer.
 // Nodes that fail are excluded silently — the AI never sees them.
 
 // FilterNodes returns the subset of nodes that are eligible to run pod.
 // A node is eligible when:
-//   1. It is Ready and not marked unschedulable (already guaranteed by readyNodes() in scheduler.go)
-//   2. The pod tolerates all taints the node carries
-//   3. The node has enough allocatable CPU and memory for the pod's requests
+//  1. It is Ready and not marked unschedulable (already guaranteed by readyNodes() in scheduler.go)
+//  2. The pod tolerates all taints the node carries
+//  3. The node satisfies the pod's requiredDuringScheduling nodeAffinity rules
+//  4. The node has enough allocatable CPU and memory for the pod's requests
 func FilterNodes(pod *v1.Pod, nodes []v1.Node) []v1.Node {
 	var eligible []v1.Node
 	for _, node := range nodes {
 		if !toleratesTaints(pod, &node) {
+			continue
+		}
+		// Hard gate: reject nodes that violate the pod's requiredDuringScheduling
+		// nodeAffinity. This is the critical check that was previously missing —
+		// without it the scorer would happily pick strix-node (highest headroom)
+		// even though the pod manifest explicitly forbids it, creating an
+		// infinite creation-rejection storm.
+		if !matchesNodeAffinity(pod, &node) {
 			continue
 		}
 		if !hasCapacity(pod, &node) {
@@ -31,6 +42,114 @@ func FilterNodes(pod *v1.Pod, nodes []v1.Node) []v1.Node {
 		eligible = append(eligible, node)
 	}
 	return eligible
+}
+
+// matchesNodeAffinity enforces the pod's requiredDuringSchedulingIgnoredDuringExecution
+// nodeAffinity. It returns true when:
+//   - the pod has no nodeAffinity / no required terms → all nodes are allowed
+//   - at least one NodeSelectorTerm in the required block matches the node
+//     (terms are OR-ed; expressions within a term are AND-ed)
+func matchesNodeAffinity(pod *v1.Pod, node *v1.Node) bool {
+	if pod.Spec.Affinity == nil {
+		return true
+	}
+	na := pod.Spec.Affinity.NodeAffinity
+	if na == nil {
+		return true
+	}
+	req := na.RequiredDuringSchedulingIgnoredDuringExecution
+	if req == nil || len(req.NodeSelectorTerms) == 0 {
+		return true
+	}
+
+	// At least one term must be satisfied (terms are OR-ed).
+	for _, term := range req.NodeSelectorTerms {
+		if nodeSelectorTermMatches(node, term) {
+			return true
+		}
+	}
+	return false
+}
+
+// nodeSelectorTermMatches returns true only when ALL MatchExpressions in the
+// term are satisfied by the node's labels (expressions within a term are AND-ed).
+func nodeSelectorTermMatches(node *v1.Node, term v1.NodeSelectorTerm) bool {
+	for _, expr := range term.MatchExpressions {
+		if !nodeSelectorRequirementMatches(node, expr) {
+			return false
+		}
+	}
+	// MatchFields are not commonly used in this context; treat as satisfied.
+	return true
+}
+
+// nodeSelectorRequirementMatches evaluates a single NodeSelectorRequirement
+// against the node's labels, supporting the full set of operators that
+// kube-scheduler itself handles.
+func nodeSelectorRequirementMatches(node *v1.Node, req v1.NodeSelectorRequirement) bool {
+	labels := node.Labels
+	val, exists := labels[req.Key]
+
+	switch req.Operator {
+	case v1.NodeSelectorOpIn:
+		// Node must have the label AND its value must be in the allowed set.
+		if !exists {
+			return false
+		}
+		for _, v := range req.Values {
+			if v == val {
+				return true
+			}
+		}
+		return false
+
+	case v1.NodeSelectorOpNotIn:
+		// Node must NOT have the label, or its value must not be in the set.
+		if !exists {
+			return true
+		}
+		for _, v := range req.Values {
+			if v == val {
+				return false
+			}
+		}
+		return true
+
+	case v1.NodeSelectorOpExists:
+		// Label key must be present (any value).
+		return exists
+
+	case v1.NodeSelectorOpDoesNotExist:
+		// Label key must be absent.
+		return !exists
+
+	case v1.NodeSelectorOpGt:
+		// Node label value must be a number greater than the requirement value.
+		if !exists || len(req.Values) == 0 {
+			return false
+		}
+		nodeNum, err1 := strconv.ParseInt(val, 10, 64)
+		reqNum, err2 := strconv.ParseInt(req.Values[0], 10, 64)
+		if err1 != nil || err2 != nil {
+			return false
+		}
+		return nodeNum > reqNum
+
+	case v1.NodeSelectorOpLt:
+		// Node label value must be a number less than the requirement value.
+		if !exists || len(req.Values) == 0 {
+			return false
+		}
+		nodeNum, err1 := strconv.ParseInt(val, 10, 64)
+		reqNum, err2 := strconv.ParseInt(req.Values[0], 10, 64)
+		if err1 != nil || err2 != nil {
+			return false
+		}
+		return nodeNum < reqNum
+	}
+
+	// Unknown operator — be conservative and reject the node.
+	return false
 }
 
 // toleratesTaints returns true if the pod's tolerations cover every taint

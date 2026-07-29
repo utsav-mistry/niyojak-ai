@@ -6,14 +6,23 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: todo-app
-  namespace: default
+  namespace: niyojak-system
   labels:
     app: todo-app
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: todo-app
+  # Strict rollout limits to prevent pod-storm loops.
+  # maxSurge: 1  — only one extra pod can exist above the desired count at a time.
+  # maxUnavailable: 0  — keep all desired pods running; never allow an empty slot
+  #                      that the deployment controller would try to fill aggressively.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
@@ -21,11 +30,22 @@ spec:
     spec:
       # This is the key line — opt into niyojak AI scheduling.
       schedulerName: niyojak-scheduler
+      # Keep app workloads off strix-node and on worker nodes only.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - worker-1
+                      - worker-2
 
       serviceAccountName: todo-app
       containers:
         - name: todo-app
-          image: ghcr.io/niyojak/niyojak-todo-app:latest
+          image: utsavmistry/niyojak-todo-app:latest
           imagePullPolicy: Always
           ports:
             - containerPort: 3000
@@ -60,24 +80,7 @@ spec:
               mountPath: /data
       volumes:
         - name: db-storage
-          persistentVolumeClaim:
-            claimName: todo-app-data
-
----
-# Shared PVC for lightweight todo persistence across pod restarts.
-# For multi-pod demos, this should be backed by a storage class that supports
-# shared access. If your cluster lacks that, keep the app at a single replica.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: todo-app-data
-  namespace: default
-spec:
-  accessModes:
-    - ReadWriteMany
-  resources:
-    requests:
-      storage: 1Gi
+          emptyDir: {}
 
 ---
 # Service — exposes the To-Do App within the cluster and optionally via NodePort.
@@ -85,7 +88,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: todo-app
-  namespace: default
+  namespace: niyojak-system
   labels:
     app: todo-app
 spec:
@@ -107,14 +110,14 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: todo-app-hpa
-  namespace: default
+  namespace: niyojak-system
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: todo-app
-  minReplicas: 2
-  maxReplicas: 15
+  minReplicas: 1
+  maxReplicas: 10
   metrics:
     - type: Resource
       resource:
@@ -131,7 +134,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: todo-app
-  namespace: default
+  namespace: niyojak-system
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -154,7 +157,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: todo-app
-    namespace: default
+    namespace: niyojak-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

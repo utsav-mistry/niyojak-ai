@@ -185,7 +185,13 @@ class FeatureStore:
         )
 
     def _prom_query(self, query: str) -> dict:
-        """Run an instant PromQL query. Returns {node_name: float_value}."""
+        """Run an instant PromQL query. Returns {node_name: float_value}.
+
+        Priority for node identity:
+          1. `node` label  — set by kube-state-metrics / node-exporter relabeling
+          2. `instance` label stripped of the `:port` suffix — last resort
+          3. Skip the result entirely if neither is usable
+        """
         r = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query",
             params={"query": query},
@@ -194,22 +200,50 @@ class FeatureStore:
         r.raise_for_status()
         result = {}
         for item in r.json().get("data", {}).get("result", []):
-            node = item["metric"].get("node") or item["metric"].get("instance", "unknown")
+            metric = item["metric"]
+            node = metric.get("node") or ""
+            if not node:
+                # Fall back to instance label but strip the `:port` suffix
+                # so we get the bare IP. We still prefer the node label.
+                instance = metric.get("instance", "")
+                node = instance.split(":")[0] if ":" in instance else instance
+            if not node or node == "unknown":
+                # Skip completely — don't create a phantom entry
+                continue
             result[node] = float(item["value"][1])
         return result
 
     def _poll_prometheus(self):
-        # CPU utilization: 1 - idle rate (per node)
-        cpu_util   = self._prom_query('1 - avg by(node)(rate(node_cpu_seconds_total{mode="idle"}[1m]))')
-        mem_util   = self._prom_query(
-            '1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)'
+        # All queries aggregate by(node) so every result uses the canonical
+        # Kubernetes node name (e.g. worker-1) not the raw instance IP:port.
+        cpu_util = self._prom_query(
+            '1 - avg by(node)(rate(node_cpu_seconds_total{mode="idle"}[1m]))'
         )
-        net_rx     = self._prom_query('rate(node_network_receive_bytes_total{device!="lo"}[1m])')
-        net_tx     = self._prom_query('rate(node_network_transmit_bytes_total{device!="lo"}[1m])')
-        load_avg   = self._prom_query('node_load1')
+        mem_util = self._prom_query(
+            '1 - avg by(node)(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)'
+        )
+        net_rx = self._prom_query(
+            'sum by(node)(rate(node_network_receive_bytes_total{device!="lo"}[1m]))'
+        )
+        net_tx = self._prom_query(
+            'sum by(node)(rate(node_network_transmit_bytes_total{device!="lo"}[1m]))'
+        )
+        load_avg = self._prom_query(
+            'avg by(node)(node_load1)'
+        )
 
         all_nodes = set(cpu_util) | set(mem_util)
         with self._lock:
+            # Prune any stale entries keyed by raw IP (from before this fix)
+            # so they don't persist as phantom nodes in the dashboard.
+            stale = [
+                k for k in self._windows
+                if k not in all_nodes and (k[0].isdigit() or k == "unknown")
+            ]
+            for k in stale:
+                logger.info("FeatureStore: pruning stale node entry '%s'", k)
+                del self._windows[k]
+
             for node in all_nodes:
                 if node not in self._windows:
                     self._windows[node] = NodeMetricsWindow(WINDOW_SIZE)
