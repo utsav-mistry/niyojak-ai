@@ -118,10 +118,15 @@ class FeatureStore:
         self._running = True
         t = threading.Thread(target=self._poll_loop, daemon=True, name="niyojak-feature-store")
         t.start()
-        logger.info(
-            "FeatureStore started — source: %s",
-            "Prometheus" if self._use_prometheus else "K8s Metrics API"
-        )
+        if self._use_prometheus:
+            logger.info("FeatureStore started — source: Prometheus (all 11 features available)")
+        else:
+            logger.warning(
+                "FeatureStore started — source: K8s Metrics API (degraded mode). "
+                "net_rx_mean and net_tx_mean will be 0; load_mean is estimated from CPU "
+                "usage rather than the real load average. "
+                "Enable Prometheus for full 11-feature scoring accuracy."
+            )
 
     def get_features(self, node_name: str) -> dict:
         """Return feature dict for node_name. Returns zeros if node not yet seen."""
@@ -171,8 +176,8 @@ class FeatureStore:
                 self._use_prometheus = True
                 logger.info("Prometheus is available at %s", PROMETHEUS_URL)
                 return
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Prometheus probe failed (%s: %s)", type(exc).__name__, exc)
         self._use_prometheus = False
         logger.warning(
             "Prometheus not reachable at %s — using K8s Metrics API fallback. "
@@ -256,13 +261,16 @@ class FeatureStore:
 
                 if node not in self._windows:
                     self._windows[node] = NodeMetricsWindow(WINDOW_SIZE)
-                # We push raw cores as cpu proxy (no total capacity from this endpoint)
+                # Load-average proxy: a node consuming N CPU cores has approximately
+                # N runnable threads, so load_avg ≈ cpu_cores in use.  This is a
+                # rough heuristic but far more informative than a hard-coded 0.
+                load_estimate = cpu_cores
                 self._windows[node].push(
                     cpu=min(cpu_cores / 4.0, 1.0),   # assume 4 vCPU max for normalization
                     mem=min(mem_bytes / (8 * 1024**3), 1.0),  # assume 8GB max
-                    net_rx=0.0,
-                    net_tx=0.0,
-                    load=0.0,
+                    net_rx=0.0,   # K8s Metrics API does not expose per-node network I/O.
+                    net_tx=0.0,   # Prometheus provides accurate rx/tx — use it in production.
+                    load=load_estimate,
                 )
 
     @staticmethod

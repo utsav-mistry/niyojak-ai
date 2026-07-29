@@ -30,7 +30,7 @@ niyojak-aiservice (Python FastAPI)
    |
    |-- Polls Prometheus every 5s (falls back to K8s Metrics API)
    |-- Maintains 60-second sliding window of node telemetry
-   |-- XGBoost regressor trained on 8,000 synthetic samples
+   |-- XGBoost regressor trained on 8,000 synthetic samples (11-feature contract)
    |-- Returns score 0-100 per (pod, node) pair in under 10ms
    |-- Falls back to weighted heuristic if model file absent
 ```

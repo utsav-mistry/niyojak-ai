@@ -5,12 +5,20 @@ ML scoring model for Niyojak AI Inference Engine.
 
 Architecture:
   - Trained with XGBoost (primary) on synthetic & real node telemetry data.
-  - Input: 10 statistical features from FeatureStore sliding window.
+  - Input: 11 statistical features from FeatureStore sliding window.
   - Output: integer score 0-100 where 100 = perfectly healthy node.
   - Falls back to a hand-tuned heuristic formula if no trained model file exists.
 
 The model file (niyojak_model.pkl) is loaded from MODEL_PATH on startup.
 Run `python train/train_model.py` to generate the model file.
+
+Heuristic formula (6 weighted factors, all 11 features covered):
+  CPU utilisation mean:      28%
+  Memory utilisation mean:   20%
+  CPU spike rate (>70%):     18%
+  Load average mean:         12%
+  CPU std deviation:         12%  — penalises bursty/flapping nodes
+  Network I/O (rx+tx):       10%  — penalises NIC-saturated nodes
 """
 
 import os
@@ -37,6 +45,19 @@ FEATURE_COLUMNS = [
     "net_rx_mean",
     "net_tx_mean",
 ]
+
+# ---------------------------------------------------------------------------
+# Heuristic normalisation constants
+# ---------------------------------------------------------------------------
+
+# Maximum expected CPU std deviation. Training burst scenario tops out at 0.30.
+# Values above this are clamped to the same penalty as fully volatile.
+_CPU_STD_MAX = 0.30
+
+# Soft NIC saturation threshold per direction (bytes/sec).
+# 500 MB/s represents a busy 1 Gbps link at 50% duplex utilisation.
+# Combined rx+tx is normalised against 2× this value.
+_NET_CAPACITY_BPS = 500e6
 
 
 class NodeScorer:
@@ -99,26 +120,44 @@ class NodeScorer:
 
     def _predict_heuristic(self, features: dict) -> int:
         """
-        Hand-tuned multi-factor scoring formula.
+        Six-factor scoring formula covering all signal dimensions.
+
         Weights:
-          - CPU utilisation mean: 35%
-          - Memory utilisation mean: 25%
-          - CPU spike rate (% of readings > 70%): 25%
-          - Load average mean (normalised to num CPUs): 15%
-        A node at 0% on all metrics gets 100. A node at 100% on all gets 0.
+          CPU utilisation mean:      28%  — primary placement signal
+          Memory utilisation mean:   20%  — OOM pressure indicator
+          CPU spike rate (>70%):     18%  — short-burst penalty
+          Load average (norm/4CPU):  12%  — scheduler queue depth
+          CPU std deviation:         12%  — burst/flap volatility penalty
+          Network I/O (rx+tx):       10%  — NIC saturation penalty
+
+        Each sub-score is independently clamped to [0, 1] before weighting,
+        so the composite is always in [0, 1] and the returned int in [0, 100].
+        A node at 0 on every metric scores 100; a fully maxed node scores 0.
         """
         cpu_score   = max(0.0, 1.0 - features.get("cpu_mean", 0.0))
         mem_score   = max(0.0, 1.0 - features.get("mem_mean", 0.0))
         spike_score = max(0.0, 1.0 - features.get("cpu_spike_rate", 0.0))
-        # load_mean is raw load average; normalise against 4 CPUs as safe default
+
+        # Load average: normalise against 4 vCPUs as a conservative baseline.
         load_norm   = min(features.get("load_mean", 0.0) / 4.0, 1.0)
         load_score  = max(0.0, 1.0 - load_norm)
 
+        # CPU std deviation: penalises bursty/flapping nodes that look fine
+        # on average but spike unpredictably (Gap 2 fix).
+        std_score   = max(0.0, 1.0 - features.get("cpu_std", 0.0) / _CPU_STD_MAX)
+
+        # Network I/O: normalise combined rx+tx against 2×NIC capacity (Gap 1 fix).
+        # A fully saturated 500 MB/s duplex link drives this to 0.
+        net_combined = features.get("net_rx_mean", 0.0) + features.get("net_tx_mean", 0.0)
+        net_score    = max(0.0, 1.0 - net_combined / (2.0 * _NET_CAPACITY_BPS))
+
         composite = (
-            0.35 * cpu_score +
-            0.25 * mem_score +
-            0.25 * spike_score +
-            0.15 * load_score
+            0.28 * cpu_score   +
+            0.20 * mem_score   +
+            0.18 * spike_score +
+            0.12 * load_score  +
+            0.12 * std_score   +
+            0.10 * net_score
         )
         return int(round(composite * 100))
 
