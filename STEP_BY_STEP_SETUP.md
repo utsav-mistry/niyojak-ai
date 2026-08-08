@@ -358,7 +358,7 @@
    This creates:
 
    ```bash
-   ai_service/model/niyojak_model.pkl
+   ai_service/model/niyojak_model.json
    ```
 
    If you are running the AI service from inside a container, rebuild and redeploy the AI service after the model is generated.

@@ -50,7 +50,7 @@ type Scheduler struct {
 func New(client kubernetes.Interface, aiEndpoint string) *Scheduler {
 	return &Scheduler{
 		client: client,
-		scorer: NewAIScorer(aiEndpoint),
+		scorer: NewAIScorer(aiEndpoint, client),
 		binder: NewBinder(client),
 	}
 }

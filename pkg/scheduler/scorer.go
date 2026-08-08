@@ -9,10 +9,16 @@ import (
 	"os"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 )
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Tunable constants — all threshold and penalty values live here so that
+// nothing is hard-coded inside logic functions.
+// ──────────────────────────────────────────────────────────────────────────────
 const (
 	// defaultAIEndpoint is used when NIYOJAK_AI_ENDPOINT is not set.
 	defaultAIEndpoint = "http://niyojak-aiservice:8000/score"
@@ -35,6 +41,43 @@ const (
 	// wide stress event) the scheduler falls back to the least-bad node rather
 	// than blocking the pod indefinitely — scheduling always makes progress.
 	minAcceptableScore = 20
+
+	// ── CPU utilization thresholds ────────────────────────────────────────────
+	// cpuHighThreshold is the projected CPU utilization ratio above which a
+	// strong penalty is applied (e.g. 0.90 = 90 %).
+	cpuHighThreshold = 0.90
+	// cpuModerateThreshold is the ratio above which a moderate penalty starts.
+	cpuModerateThreshold = 0.70
+
+	// cpuHighPenalty is the score penalty when projected CPU exceeds cpuHighThreshold.
+	cpuHighPenalty = int64(20)
+	// cpuModeratePenalty is the score penalty when projected CPU exceeds cpuModerateThreshold.
+	cpuModeratePenalty = int64(10)
+
+	// ── Memory utilization thresholds ─────────────────────────────────────────
+	// memHighThreshold is the projected memory utilization ratio above which a
+	// strong penalty is applied.
+	memHighThreshold = 0.90
+	// memModerateThreshold is the ratio above which a moderate penalty starts.
+	memModerateThreshold = 0.70
+
+	// memHighPenalty is the score penalty when projected memory exceeds memHighThreshold.
+	memHighPenalty = int64(20)
+	// memModeratePenalty is the score penalty when projected memory exceeds memModerateThreshold.
+	memModeratePenalty = int64(10)
+
+	// ── Pod density heuristic ─────────────────────────────────────────────────
+	// podDensityThreshold is the number of existing pods on a node above which
+	// the density penalty kicks in.
+	podDensityThreshold = 30
+	// podDensityPenalty is the flat penalty applied when pod count exceeds
+	// podDensityThreshold.  It is capped (not multiplied), so a very crowded
+	// node is penalised by at most this many points.
+	podDensityPenalty = int64(5)
+
+	// ── Score bounds ──────────────────────────────────────────────────────────
+	minScore = int64(0)
+	maxScore = int64(100)
 )
 
 // ScoreRequest is the JSON body sent to the AI service for each (pod, node) pair.
@@ -64,12 +107,13 @@ type ScoreResponse struct {
 type AIScorer struct {
 	endpoint string
 	client   *http.Client
+	k8sClient kubernetes.Interface
 }
 
 // NewAIScorer creates an AIScorer pointed at the given endpoint.
 // If endpoint is empty it falls back to the NIYOJAK_AI_ENDPOINT env var,
 // then to the in-cluster default service address.
-func NewAIScorer(endpoint string) *AIScorer {
+func NewAIScorer(endpoint string, client kubernetes.Interface) *AIScorer {
 	if endpoint == "" {
 		endpoint = os.Getenv("NIYOJAK_AI_ENDPOINT")
 	}
@@ -77,8 +121,9 @@ func NewAIScorer(endpoint string) *AIScorer {
 		endpoint = defaultAIEndpoint
 	}
 	return &AIScorer{
-		endpoint: endpoint,
-		client:   &http.Client{Timeout: aiTimeout},
+		endpoint:  endpoint,
+		client:    &http.Client{Timeout: aiTimeout},
+		k8sClient: client,
 	}
 }
 
@@ -99,7 +144,7 @@ func (s *AIScorer) BestNode(ctx context.Context, pod *v1.Pod, nodes []v1.Node) (
 	// Score every candidate node.
 	scores := make([]result, len(nodes))
 	for i, node := range nodes {
-		sc := s.scoreNode(ctx, pod, node.Name)
+		sc := s.scoreNode(ctx, pod, &node)
 		scores[i] = result{nodeName: node.Name, score: sc}
 		klog.V(4).Infof("[niyojak] node %s scored %d/100 for pod %s/%s",
 			node.Name, sc, pod.Namespace, pod.Name)
@@ -107,7 +152,7 @@ func (s *AIScorer) BestNode(ctx context.Context, pod *v1.Pod, nodes []v1.Node) (
 
 	// Apply minimum score threshold: prefer nodes scoring at or above
 	// minAcceptableScore.  This prevents scheduling onto severely stressed nodes
-	// when healthier alternatives exist (Gap 4 fix).
+	// when healthier alternatives exist.
 	// If every node is below the threshold we fall back to the global least-bad
 	// node rather than blocking the pod indefinitely.
 	var preferred []result
@@ -142,9 +187,11 @@ func (s *AIScorer) BestNode(ctx context.Context, pod *v1.Pod, nodes []v1.Node) (
 	return best.nodeName, best.score, nil
 }
 
-// scoreNode calls the AI service for a single (pod, node) pair.
+// scoreNode calls the AI service for a single (pod, node) pair,
+// then applies a heuristic penalty based on projected utilization.
 // It always returns a valid score — on any error it returns fallbackScore.
-func (s *AIScorer) scoreNode(ctx context.Context, pod *v1.Pod, nodeName string) int64 {
+func (s *AIScorer) scoreNode(ctx context.Context, pod *v1.Pod, node *v1.Node) int64 {
+	nodeName := node.Name
 	req := s.buildRequest(pod, nodeName)
 
 	body, err := json.Marshal(req)
@@ -178,17 +225,133 @@ func (s *AIScorer) scoreNode(ctx context.Context, pod *v1.Pod, nodeName string) 
 		return fallbackScore
 	}
 
-	score := scoreResp.Score
+	aiScore := scoreResp.Score
+
+	// Calculate and apply heuristic penalty.
+	penalty, cpuUtil, memUtil, densityPenalty, cpuPenalty, memPenalty :=
+		s.calculateHeuristicPenalty(ctx, pod, node)
+
+	finalScore := aiScore - penalty
+
 	// Clamp defensively — never trust external input unconditionally.
-	if score < 0 {
-		score = 0
+	if finalScore < minScore {
+		finalScore = minScore
 	}
-	if score > 100 {
-		score = 100
+	if finalScore > maxScore {
+		finalScore = maxScore
 	}
 
-	klog.V(2).Infof("[niyojak] AI scored node %s: %d (%s) — %s", nodeName, score, scoreResp.Source, scoreResp.Reason)
-	return score
+	// Structured log with all scoring components for observability.
+	klog.V(2).Infof(
+		"[niyojak] score node=%s pod=%s/%s | ai_score=%d source=%s | cpu_util=%.1f%% mem_util=%.1f%% | penalties: cpu=%d mem=%d density=%d total=%d | final=%d | reason=%q",
+		nodeName, pod.Namespace, pod.Name,
+		aiScore, scoreResp.Source,
+		cpuUtil*100, memUtil*100,
+		cpuPenalty, memPenalty, densityPenalty, penalty,
+		finalScore,
+		scoreResp.Reason,
+	)
+
+	return finalScore
+}
+
+// heuristicResult groups all intermediate values from calculateHeuristicPenalty
+// so that scoreNode can log them without a second computation pass.
+// calculateHeuristicPenalty computes penalties for CPU/memory projected utilization
+// and pod density to prevent node saturation during pod storms.
+//
+// Returns:
+//
+//	totalPenalty  – sum of all penalties (to be subtracted from the AI score)
+//	cpuUtil       – projected CPU utilization ratio (0–1)
+//	memUtil       – projected memory utilization ratio (0–1)
+//	densityPenalty – the pod-density component of the penalty
+//	cpuPenalty     – the CPU component of the penalty
+//	memPenalty     – the memory component of the penalty
+func (s *AIScorer) calculateHeuristicPenalty(ctx context.Context, pod *v1.Pod, node *v1.Node) (
+	totalPenalty int64,
+	cpuUtil float64,
+	memUtil float64,
+	densityPenalty int64,
+	cpuPenalty int64,
+	memPenalty int64,
+) {
+	// 1. Get running pods on the node via the Kubernetes API.
+	fs := fmt.Sprintf("spec.nodeName=%s,status.phase!=Succeeded,status.phase!=Failed", node.Name)
+	podList, err := s.k8sClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fs})
+	if err != nil {
+		klog.Warningf("[niyojak] failed to list pods on node %s for heuristics: %v", node.Name, err)
+		return 0, 0, 0, 0, 0, 0
+	}
+
+	// 2. Sum up resources currently requested on the node.
+	var currentCPUMilli int64
+	var currentMemBytes int64
+	for _, p := range podList.Items {
+		for _, c := range p.Spec.Containers {
+			if cpu, ok := c.Resources.Requests[v1.ResourceCPU]; ok {
+				currentCPUMilli += cpu.MilliValue()
+			}
+			if mem, ok := c.Resources.Requests[v1.ResourceMemory]; ok {
+				currentMemBytes += mem.Value()
+			}
+		}
+	}
+
+	// 3. Get incoming pod's resource requests.
+	var podCPUMilli int64
+	var podMemBytes int64
+	for _, c := range pod.Spec.Containers {
+		if cpu, ok := c.Resources.Requests[v1.ResourceCPU]; ok {
+			podCPUMilli += cpu.MilliValue()
+		}
+		if mem, ok := c.Resources.Requests[v1.ResourceMemory]; ok {
+			podMemBytes += mem.Value()
+		}
+	}
+
+	// 4. Calculate projected utilization ratios.
+	allocCPU := node.Status.Allocatable[v1.ResourceCPU]
+	allocMem := node.Status.Allocatable[v1.ResourceMemory]
+	allocCPUMilli := allocCPU.MilliValue()
+	allocMemBytes := allocMem.Value()
+
+	if allocCPUMilli > 0 {
+		cpuUtil = float64(currentCPUMilli+podCPUMilli) / float64(allocCPUMilli)
+	}
+	if allocMemBytes > 0 {
+		memUtil = float64(currentMemBytes+podMemBytes) / float64(allocMemBytes)
+	}
+
+	// 5. Apply tiered CPU penalty using named thresholds.
+	//    90 %+ → strong penalty; 70 %+ → moderate penalty.
+	switch {
+	case cpuUtil > cpuHighThreshold:
+		cpuPenalty = cpuHighPenalty
+	case cpuUtil > cpuModerateThreshold:
+		cpuPenalty = cpuModeratePenalty
+	}
+
+	// 6. Apply tiered memory penalty using named thresholds.
+	//    90 %+ → strong penalty; 70 %+ → moderate penalty.
+	switch {
+	case memUtil > memHighThreshold:
+		memPenalty = memHighPenalty
+	case memUtil > memModerateThreshold:
+		memPenalty = memModeratePenalty
+	}
+
+	// 7. Apply capped pod-density penalty.
+	//    Only applied when the existing pod count exceeds podDensityThreshold.
+	//    The penalty is a flat cap (podDensityPenalty) rather than a multiplier,
+	//    so an extremely dense node is not penalised disproportionately.
+	podCount := len(podList.Items)
+	if podCount > podDensityThreshold {
+		densityPenalty = podDensityPenalty
+	}
+
+	totalPenalty = cpuPenalty + memPenalty + densityPenalty
+	return totalPenalty, cpuUtil, memUtil, densityPenalty, cpuPenalty, memPenalty
 }
 
 // buildRequest extracts the pod's first container's resource requests and

@@ -2,169 +2,127 @@
 model.py
 --------
 ML scoring model for Niyojak AI Inference Engine.
-
-Architecture:
-  - Trained with XGBoost (primary) on synthetic & real node telemetry data.
-  - Input: 11 statistical features from FeatureStore sliding window.
-  - Output: integer score 0-100 where 100 = perfectly healthy node.
-  - Falls back to a hand-tuned heuristic formula if no trained model file exists.
-
-The model file (niyojak_model.pkl) is loaded from MODEL_PATH on startup.
-Run `python train/train_model.py` to generate the model file.
-
-Heuristic formula (6 weighted factors, all 11 features covered):
-  CPU utilisation mean:      28%
-  Memory utilisation mean:   20%
-  CPU spike rate (>70%):     18%
-  Load average mean:         12%
-  CPU std deviation:         12%  — penalises bursty/flapping nodes
-  Network I/O (rx+tx):       10%  — penalises NIC-saturated nodes
+Matches the exact 18-feature schema expected by the offline training pipeline.
 """
 
 import os
 import pickle
 import logging
 import numpy as np
-from typing import Optional
+from xgboost import XGBRegressor
 
 logger = logging.getLogger("niyojak.model")
 
-MODEL_PATH = os.getenv("MODEL_PATH", "/app/model/niyojak_model.pkl")
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/model/niyojak_model.json")
 
-# Feature vector order — MUST match FEATURE_COLUMNS in train_model.py exactly
+# 18-Feature Schema exactly as defined in train_model.py
 FEATURE_COLUMNS = [
-    "cpu_mean",
-    "cpu_max",
-    "cpu_std",
-    "cpu_spike_rate",
-    "mem_mean",
-    "mem_max",
-    "mem_std",
-    "load_mean",
-    "load_max",
-    "net_rx_mean",
-    "net_tx_mean",
+    "cluster_size",
+    "node_allocatable_cpu",
+    "node_allocatable_memory",
+    "current_cpu_usage",
+    "current_memory_usage",
+    "current_cpu_percent",
+    "current_memory_percent",
+    "current_pod_count",
+    "requested_cpu",
+    "requested_memory",
+    "projected_cpu_percent",
+    "projected_memory_percent",
+    "cpu_headroom",
+    "memory_headroom",
+    "resource_balance",
+    "cpu_request_ratio",
+    "memory_request_ratio",
+    "packing_density",
 ]
 
-# ---------------------------------------------------------------------------
-# Heuristic normalisation constants
-# ---------------------------------------------------------------------------
-
-# Maximum expected CPU std deviation. Training burst scenario tops out at 0.30.
-# Values above this are clamped to the same penalty as fully volatile.
-_CPU_STD_MAX = 0.30
-
-# Soft NIC saturation threshold per direction (bytes/sec).
-# 500 MB/s represents a busy 1 Gbps link at 50% duplex utilisation.
-# Combined rx+tx is normalised against 2× this value.
-_NET_CAPACITY_BPS = 500e6
-
-
 class NodeScorer:
-    """
-    Wraps an XGBoost model (or a heuristic fallback) to score K8s nodes.
-
-    Usage:
-        scorer = NodeScorer()
-        scorer.load()
-        score = scorer.predict(features_dict)  # returns int 0-100
-    """
-
+    """Wraps the XGBoost model or heuristic fallback for node scoring."""
+    
     def __init__(self):
         self._model = None
-        self._source = "heuristic"   # "xgboost" or "heuristic"
+        self._source = "heuristic"
 
     def load(self):
-        """Try to load the trained XGBoost model. Falls back to heuristic if file absent."""
-        if os.path.exists(MODEL_PATH):
+        candidates = self._candidate_model_paths(MODEL_PATH)
+        for candidate in candidates:
+            if not os.path.exists(candidate):
+                continue
             try:
-                with open(MODEL_PATH, "rb") as f:
-                    self._model = pickle.load(f)
+                self._model = self._load_model_file(candidate)
                 self._source = "xgboost"
-                logger.info("XGBoost model loaded from %s", MODEL_PATH)
+                logger.info("XGBoost model loaded from %s", candidate)
+                return
             except Exception as exc:
-                logger.warning("Failed to load model from %s: %s — using heuristic", MODEL_PATH, exc)
-                self._model = None
-                self._source = "heuristic"
-        else:
-            logger.warning(
-                "Model file not found at %s — using built-in heuristic scorer. "
-                "Run `python train/train_model.py` to train and save a model.",
-                MODEL_PATH,
-            )
+                logger.warning("Failed to load model from %s: %s", candidate, exc)
+
+        logger.warning(
+            "Model file not found at %s — using built-in heuristic fallback.",
+            MODEL_PATH
+        )
+        self._model = None
+        self._source = "heuristic"
+
+    def _candidate_model_paths(self, model_path: str) -> list[str]:
+        root, ext = os.path.splitext(model_path)
+        if ext.lower() == ".json":
+            return [model_path, root + ".pkl"]
+        if ext.lower() == ".pkl":
+            return [model_path, root + ".json"]
+        return [model_path, root + ".json", root + ".pkl"]
+
+    def _load_model_file(self, path: str):
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".json":
+            model = XGBRegressor()
+            model.load_model(path)
+            return model
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
     def predict(self, features: dict) -> tuple[int, str]:
-        """
-        Score a node given its feature dict from FeatureStore.
-
-        Returns:
-            (score: int 0-100, source: str)  — score 100 = ideal placement target.
-        """
         if self._model is not None:
             return self._predict_xgboost(features), "xgboost"
         return self._predict_heuristic(features), "heuristic"
 
-    # ------------------------------------------------------------------
-    # XGBoost inference
-    # ------------------------------------------------------------------
-
     def _predict_xgboost(self, features: dict) -> int:
+        # Extract features safely in exact expected order
         vec = np.array([[features.get(col, 0.0) for col in FEATURE_COLUMNS]])
-        # XGBRegressor.predict() returns a float score 0-100 (regression target)
         raw = float(self._model.predict(vec)[0])
         return int(round(max(0.0, min(100.0, raw))))
 
-    # ------------------------------------------------------------------
-    # Built-in heuristic fallback (no trained model required)
-    # ------------------------------------------------------------------
-
     def _predict_heuristic(self, features: dict) -> int:
         """
-        Six-factor scoring formula covering all signal dimensions.
-
-        Weights:
-          CPU utilisation mean:      28%  — primary placement signal
-          Memory utilisation mean:   20%  — OOM pressure indicator
-          CPU spike rate (>70%):     18%  — short-burst penalty
-          Load average (norm/4CPU):  12%  — scheduler queue depth
-          CPU std deviation:         12%  — burst/flap volatility penalty
-          Network I/O (rx+tx):       10%  — NIC saturation penalty
-
-        Each sub-score is independently clamped to [0, 1] before weighting,
-        so the composite is always in [0, 1] and the returned int in [0, 100].
-        A node at 0 on every metric scores 100; a fully maxed node scores 0.
+        Fallback scoring based on capacity and dynamic projections.
         """
-        cpu_score   = max(0.0, 1.0 - features.get("cpu_mean", 0.0))
-        mem_score   = max(0.0, 1.0 - features.get("mem_mean", 0.0))
-        spike_score = max(0.0, 1.0 - features.get("cpu_spike_rate", 0.0))
-
-        # Load average: normalise against 4 vCPUs as a conservative baseline.
-        load_norm   = min(features.get("load_mean", 0.0) / 4.0, 1.0)
-        load_score  = max(0.0, 1.0 - load_norm)
-
-        # CPU std deviation: penalises bursty/flapping nodes that look fine
-        # on average but spike unpredictably (Gap 2 fix).
-        std_score   = max(0.0, 1.0 - features.get("cpu_std", 0.0) / _CPU_STD_MAX)
-
-        # Network I/O: normalise combined rx+tx against 2×NIC capacity (Gap 1 fix).
-        # A fully saturated 500 MB/s duplex link drives this to 0.
-        net_combined = features.get("net_rx_mean", 0.0) + features.get("net_tx_mean", 0.0)
-        net_score    = max(0.0, 1.0 - net_combined / (2.0 * _NET_CAPACITY_BPS))
-
-        composite = (
-            0.28 * cpu_score   +
-            0.20 * mem_score   +
-            0.18 * spike_score +
-            0.12 * load_score  +
-            0.12 * std_score   +
-            0.10 * net_score
-        )
-        return int(round(composite * 100))
+        # Headroom (higher is better)
+        cpu_hr = max(0.0, min(1.0, features.get("cpu_headroom", 0.0)))
+        mem_hr = max(0.0, min(1.0, features.get("memory_headroom", 0.0)))
+        
+        # Penalties (lower is better, so 1 - penalty is higher)
+        balance_penalty = max(0.0, min(1.0, features.get("resource_balance", 0.0)))
+        density_penalty = max(0.0, min(1.0, features.get("packing_density", 0.0)))
+        
+        # High saturation penalty
+        proj_cpu = features.get("projected_cpu_percent", 0.0)
+        proj_mem = features.get("projected_memory_percent", 0.0)
+        
+        saturation_penalty = 0.0
+        if proj_cpu > 0.9:
+            saturation_penalty += (proj_cpu - 0.9) * 5
+        if proj_mem > 0.9:
+            saturation_penalty += (proj_mem - 0.9) * 5
+        saturation_penalty = min(1.0, saturation_penalty)
+        
+        # Weights: 40% CPU HR, 40% Mem HR, 10% Balance, 10% Density
+        base = (0.40 * cpu_hr) + (0.40 * mem_hr) + (0.10 * (1.0 - balance_penalty)) + (0.10 * (1.0 - density_penalty))
+        
+        score = base * (1.0 - saturation_penalty)
+        return int(round(max(0.0, min(1.0, score)) * 100))
 
     @property
     def source(self) -> str:
         return self._source
 
-
-# Singleton instance
 node_scorer = NodeScorer()

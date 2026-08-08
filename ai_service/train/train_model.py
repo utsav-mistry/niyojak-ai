@@ -1,423 +1,532 @@
 """
-train_model.py — niyojak XGBoost node scoring model trainer
+train_model.py — Niyojak Student Model Trainer
+===============================================
 
-Generates synthetic node telemetry data covering ten realistic scenarios
-and trains an XGBoost regression model to predict a node placement score (0-100).
+OFFLINE DEVELOPER TOOL — never called by the production scheduler.
+The runtime AI service uses a frozen, pre-trained model for inference.
 
-Scenario catalogue
-------------------
-  1.  Healthy idle             score 88-100  (cold / newly-provisioned node)
-  2.  Healthy active           score 78-92   (steady moderate workload, lots of headroom)
-  3.  Near-capacity            score 42-62   (approaching limits but not saturated)
-  4.  Moderate load            score 40-70   (typical busy node)
-  5.  Memory pressure          score 18-42   (high mem, low CPU — potential OOM risk)
-  6.  CPU burst / flapping     score 22-50   (intermittent CPU spikes, high std)
-  7.  Network-bound            score 30-58   (high net I/O, moderate compute)
-  8.  Mixed stress             score 8-35    (high mem + moderate-high CPU together)
-  9.  Stressed / saturating    score 4-36    (high CPU, high mem, high load)
-  10. Fully saturated          score 0-12    (everything maxed — worst-case edge)
+Teacher-Student Architecture
+-----------------------------
+Input  : teacher_dataset.csv / teacher_dataset.parquet  (from generate_dataset.py)
+Teacher: the Go scheduler's heuristic scoring formula
+Student: XGBoost regression model approximating the teacher
 
-The trained model is saved to ../model/niyojak_model.pkl and loaded at
-runtime by ai_service/app/model.py.
+Train/Test Split
+-----------------
+Split is performed BY EVENT (event_id), not by row.  This prevents
+data leakage: all (pod, node) pairs from the same scheduling event
+stay on the same side of the split.
 
-Usage:
-    python train_model.py
+Feature Policy
+---------------
+IDs (event_id, cluster_id, pod_id, node_id, best_node_id) are METADATA
+and are never passed to the model as input features.
 
-Output:
-    ../model/niyojak_model.pkl
+Labels (teacher_score, selected_by_scheduler, teacher_rank,
+score_gap_from_best, winner_score) are also excluded from features.
+
+Penalty components (cpu_penalty, memory_penalty, density_penalty) are
+kept as features because they encode the teacher's reasoning and improve
+model explainability.
+
+Usage
+-----
+    # Step 1: generate the dataset (run once, or when teacher changes)
+    python train/generate_dataset.py --target-events 20000
+
+    # Step 2: train the student model
+    python train/train_model.py
+
+    # Specify a different dataset path
+    python train/train_model.py --dataset-path data/teacher_dataset.parquet
+
+Output
+------
+    model/niyojak_model.json
+    model/metadata.json
 """
 
-import os
-import pickle
+import argparse
+import json
 import logging
+import os
+import random
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
+from sklearn.metrics import (
+    explained_variance_score,
+    mean_absolute_error,
+    mean_absolute_percentage_error,
+    mean_squared_error,
+    median_absolute_error,
+    r2_score,
+)
+from sklearn.model_selection import GroupShuffleSplit
+import xgboost as xgb
 from xgboost import XGBRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("niyojak.train")
 
-# Feature columns must exactly match what feature_store.py produces
-# and what model.py expects at inference time.
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+_HERE      = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR  = os.path.join(_HERE, "..", "data")
+_MODEL_DIR = os.path.join(_HERE, "..", "model")
+MODEL_PATH = os.path.join(_MODEL_DIR, "niyojak_model.json")
+METADATA_PATH = os.path.join(_MODEL_DIR, "metadata.json")
+
+# Default dataset search order: parquet first (smaller), then CSV
+DEFAULT_PARQUET = os.path.join(_DATA_DIR, "teacher_dataset.parquet")
+DEFAULT_CSV     = os.path.join(_DATA_DIR, "teacher_dataset.csv")
+
+
+# ---------------------------------------------------------------------------
+# Feature columns
+#
+# Policy:
+#   - IDs (event_id, cluster_id, pod_id, node_id, best_node_id)  → NEVER features
+#   - Labels (teacher_score, teacher_rank, selected_by_scheduler,
+#             score_gap_from_best, winner_score)                  → NEVER features
+#   - Feasibility metadata (feasible, reject_reason)              → NEVER features
+#   - All numeric signals below                                   → features
+#
+# Penalty components (cpu_penalty, memory_penalty, density_penalty) are
+# included because they directly encode teacher reasoning — they give the
+# model a head start on the teacher's decision logic.
+# ---------------------------------------------------------------------------
 FEATURE_COLUMNS = [
-    "cpu_mean",
-    "cpu_max",
-    "cpu_std",
-    "cpu_spike_rate",
-    "mem_mean",
-    "mem_max",
-    "mem_std",
-    "load_mean",
-    "load_max",
-    "net_rx_mean",
-    "net_tx_mean",
+    # ── Node capacity context ─────────────────────────────────────────
+    "cluster_size",
+    # Keep allocatable capacities (absolute capacities are redundant)
+    "node_allocatable_cpu",
+    "node_allocatable_memory",
+
+    # ── Current node state ────────────────────────────────────────────
+    "current_cpu_usage",
+    "current_memory_usage",
+    "current_cpu_percent",
+    "current_memory_percent",
+    "current_pod_count",
+
+    # ── Incoming pod ──────────────────────────────────────────────────
+    "requested_cpu",
+    "requested_memory",
+
+    # ── Projected state ───────────────────────────────────────────────
+    # Keep projected percents as compact representation of projected state
+    "projected_cpu_percent",
+    "projected_memory_percent",
+
+    # ── Derived features ──────────────────────────────────────────────
+    # Derived compact features (avoid duplication)
+    "cpu_headroom",
+    "memory_headroom",
+    "resource_balance",
+    "cpu_request_ratio",
+    "memory_request_ratio",
+    "packing_density",
 ]
 
-# Output directory for the trained model
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "model")
-MODEL_PATH = os.path.join(MODEL_DIR, "niyojak_model.pkl")
-
-# Total samples — distributed across 10 scenarios
-N_SAMPLES_DEFAULT = 30_000
+TARGET_COLUMN = "teacher_score"
+GROUP_COLUMN  = "event_id"      # used for event-level train/test split
 
 
-def _clamp(val: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, val))
+# ---------------------------------------------------------------------------
+# Dataset loader
+# ---------------------------------------------------------------------------
 
-
-def generate_dataset(n_samples: int = N_SAMPLES_DEFAULT) -> pd.DataFrame:
+def load_dataset(path: str = "") -> tuple[pd.DataFrame, str]:
     """
-    Generate synthetic node telemetry data with labelled placement scores.
-
-    Ten scenario classes span the full range of realistic node states, including
-    edge cases (fully-saturated, near-zero warmup, memory-only pressure, bursting
-    CPU, network-bound nodes, and mixed stress). Each scenario is allocated an
-    equal slice of n_samples; the remainder goes to the last scenario.
-
-    Score interpretation:
-        88-100  -> ideal placement target (very healthy / idle)
-        78-92   -> healthy with active workload
-        42-62   -> near capacity but acceptable
-        40-70   -> moderate load
-        18-42   -> memory-pressure risk
-        22-50   -> bursty / flapping CPU
-        30-58   -> network-bound
-         8-35   -> mixed stress
-         4-36   -> heavily stressed / saturating
-         0-12   -> fully saturated -- avoid at all costs
+    Load the teacher dataset.  Tries the supplied path first, then falls
+    back to parquet, then CSV in the default data directory.
     """
-    rng = np.random.default_rng(seed=42)
-    rows: list[dict] = []
+    candidates = [path] if path else []
+    candidates += [DEFAULT_PARQUET, DEFAULT_CSV]
 
-    n = n_samples // 10
+    for p in candidates:
+        if not p:
+            continue
+        if not os.path.exists(p):
+            continue
+        ext = os.path.splitext(p)[1].lower()
+        logger.info("Loading dataset from %s", p)
+        if ext == ".parquet":
+            try:
+                df = pd.read_parquet(p, engine="fastparquet")
+                logger.info("Loaded %d rows from Parquet", len(df))
+                return df, p
+            except Exception as exc:
+                logger.warning("Parquet load failed (%s) — trying CSV", exc)
+        else:
+            df = pd.read_csv(p)
+            logger.info("Loaded %d rows from CSV", len(df))
+            return df, p
 
-    # ------------------------------------------------------------------
-    # Scenario 1 -- Healthy idle / warm-up (newly provisioned node)
-    # Very low CPU and memory; network and load near-zero.
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.01, 0.10)
-        mem = rng.uniform(0.05, 0.20)
-        load = rng.uniform(0.01, 0.15)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.005, 0.03)),
-            "cpu_std":        rng.uniform(0.001, 0.010),
-            "cpu_spike_rate": rng.uniform(0.0, 0.01),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.005, 0.02)),
-            "mem_std":        rng.uniform(0.001, 0.008),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.01, 0.10),
-            "net_rx_mean":    rng.uniform(0, 5e4),
-            "net_tx_mean":    rng.uniform(0, 5e4),
-            "score":          rng.uniform(88, 100),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 2 -- Healthy active (steady moderate workload, headroom)
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.05, 0.28)
-        mem = rng.uniform(0.10, 0.38)
-        load = rng.uniform(0.10, 0.55)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.02, 0.07)),
-            "cpu_std":        rng.uniform(0.005, 0.025),
-            "cpu_spike_rate": rng.uniform(0.0, 0.04),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.01, 0.06)),
-            "mem_std":        rng.uniform(0.003, 0.018),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.10, 0.50),
-            "net_rx_mean":    rng.uniform(1e4, 3e6),
-            "net_tx_mean":    rng.uniform(1e4, 3e6),
-            "score":          rng.uniform(78, 92),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 3 -- Near-capacity (approaching limits, headroom shrinking)
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.55, 0.72)
-        mem = rng.uniform(0.58, 0.75)
-        load = rng.uniform(1.5, 3.0)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.05, 0.18)),
-            "cpu_std":        rng.uniform(0.03, 0.10),
-            "cpu_spike_rate": rng.uniform(0.05, 0.25),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.04, 0.12)),
-            "mem_std":        rng.uniform(0.01, 0.06),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.5, 2.0),
-            "net_rx_mean":    rng.uniform(5e6, 30e6),
-            "net_tx_mean":    rng.uniform(5e6, 30e6),
-            "score":          rng.uniform(42, 62),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 4 -- Moderate load (typical busy production node)
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.30, 0.62)
-        mem = rng.uniform(0.35, 0.68)
-        load = rng.uniform(0.80, 2.50)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.05, 0.15)),
-            "cpu_std":        rng.uniform(0.02, 0.09),
-            "cpu_spike_rate": rng.uniform(0.0, 0.20),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.04, 0.12)),
-            "mem_std":        rng.uniform(0.01, 0.06),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.4, 1.5),
-            "net_rx_mean":    rng.uniform(1e6, 20e6),
-            "net_tx_mean":    rng.uniform(1e6, 20e6),
-            "score":          rng.uniform(40, 70),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 5 -- Memory pressure (high mem, low CPU -- OOM risk)
-    # Edge case: memory is near-critical but CPU is still fine.
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.05, 0.35)
-        mem = rng.uniform(0.78, 0.97)
-        load = rng.uniform(0.20, 1.50)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.02, 0.10)),
-            "cpu_std":        rng.uniform(0.01, 0.06),
-            "cpu_spike_rate": rng.uniform(0.0, 0.10),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.005, 0.04)),
-            "mem_std":        rng.uniform(0.005, 0.025),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.20, 1.0),
-            "net_rx_mean":    rng.uniform(5e4, 8e6),
-            "net_tx_mean":    rng.uniform(5e4, 8e6),
-            "score":          rng.uniform(18, 42),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 6 -- CPU burst / flapping (intermittent spikes, high std)
-    # Edge case: average looks okay but variance is very high.
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu_base = rng.uniform(0.25, 0.55)
-        cpu_spike = rng.uniform(0.30, 0.55)
-        cpu_mean = _clamp(cpu_base + rng.uniform(-0.05, 0.05))
-        mem_mean = rng.uniform(0.25, 0.60)
-        load_mean = rng.uniform(1.0, 3.5)
-        rows.append({
-            "cpu_mean":       cpu_mean,
-            "cpu_max":        _clamp(cpu_mean + cpu_spike),
-            "cpu_std":        rng.uniform(0.12, 0.30),   # high variance is the signal
-            "cpu_spike_rate": rng.uniform(0.20, 0.65),
-            "mem_mean":       mem_mean,
-            "mem_max":        _clamp(mem_mean + rng.uniform(0.02, 0.10)),
-            "mem_std":        rng.uniform(0.01, 0.05),
-            "load_mean":      load_mean,
-            "load_max":       load_mean + rng.uniform(0.5, 3.5),
-            "net_rx_mean":    rng.uniform(2e5, 15e6),
-            "net_tx_mean":    rng.uniform(2e5, 15e6),
-            "score":          rng.uniform(22, 50),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 7 -- Network-bound (high net I/O, moderate compute)
-    # Edge case: ingress/egress saturated but CPU+mem look fine.
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.10, 0.45)
-        mem = rng.uniform(0.15, 0.55)
-        load = rng.uniform(0.50, 2.0)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.03, 0.12)),
-            "cpu_std":        rng.uniform(0.01, 0.06),
-            "cpu_spike_rate": rng.uniform(0.0, 0.12),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.02, 0.08)),
-            "mem_std":        rng.uniform(0.005, 0.03),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.5, 2.0),
-            "net_rx_mean":    rng.uniform(80e6, 500e6),   # near NIC capacity
-            "net_tx_mean":    rng.uniform(80e6, 500e6),
-            "score":          rng.uniform(30, 58),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 8 -- Mixed stress (high mem + moderate-high CPU together)
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.55, 0.82)
-        mem = rng.uniform(0.72, 0.93)
-        load = rng.uniform(2.0, 5.0)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.05, 0.18)),
-            "cpu_std":        rng.uniform(0.04, 0.12),
-            "cpu_spike_rate": rng.uniform(0.15, 0.55),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.01, 0.07)),
-            "mem_std":        rng.uniform(0.01, 0.06),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(1.0, 3.0),
-            "net_rx_mean":    rng.uniform(10e6, 80e6),
-            "net_tx_mean":    rng.uniform(10e6, 80e6),
-            "score":          rng.uniform(8, 35),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 9 -- Stressed / saturating (high CPU, high mem, high load)
-    # ------------------------------------------------------------------
-    for _ in range(n):
-        cpu = rng.uniform(0.75, 0.99)
-        mem = rng.uniform(0.72, 0.98)
-        load = rng.uniform(3.0, 8.0)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.005, 0.10)),
-            "cpu_std":        rng.uniform(0.04, 0.15),
-            "cpu_spike_rate": rng.uniform(0.35, 1.0),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.005, 0.08)),
-            "mem_std":        rng.uniform(0.02, 0.10),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(1.0, 4.0),
-            "net_rx_mean":    rng.uniform(20e6, 200e6),
-            "net_tx_mean":    rng.uniform(20e6, 200e6),
-            "score":          rng.uniform(4, 36),
-        })
-
-    # ------------------------------------------------------------------
-    # Scenario 10 -- Fully saturated (worst-case edge: everything at max)
-    # Remainder of samples go here so totals always sum to n_samples.
-    # ------------------------------------------------------------------
-    n_last = n_samples - 9 * n
-    for _ in range(n_last):
-        cpu = rng.uniform(0.92, 1.0)
-        mem = rng.uniform(0.91, 1.0)
-        load = rng.uniform(7.0, 16.0)
-        rows.append({
-            "cpu_mean":       cpu,
-            "cpu_max":        _clamp(cpu + rng.uniform(0.0, 0.05)),
-            "cpu_std":        rng.uniform(0.005, 0.06),   # low std -- pinned at max
-            "cpu_spike_rate": rng.uniform(0.80, 1.0),
-            "mem_mean":       mem,
-            "mem_max":        _clamp(mem + rng.uniform(0.0, 0.04)),
-            "mem_std":        rng.uniform(0.002, 0.04),
-            "load_mean":      load,
-            "load_max":       load + rng.uniform(0.5, 5.0),
-            "net_rx_mean":    rng.uniform(150e6, 1e9),    # saturated NIC
-            "net_tx_mean":    rng.uniform(150e6, 1e9),
-            "score":          rng.uniform(0, 12),
-        })
-
-    df = pd.DataFrame(rows)
-    # Shuffle so all scenarios are interleaved during training
-    return df.sample(frac=1, random_state=42).reset_index(drop=True)
-
-
-def train(df: pd.DataFrame) -> XGBRegressor:
-    X = df[FEATURE_COLUMNS]
-    y = df["score"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.15, random_state=42
+    raise FileNotFoundError(
+        "No dataset found.  Run:\n"
+        "    python train/generate_dataset.py\n"
+        "to generate teacher_dataset.csv / .parquet first."
     )
 
-    model = XGBRegressor(
-        n_estimators=400,
-        max_depth=6,
-        learning_rate=0.06,
-        subsample=0.85,
-        colsample_bytree=0.80,
-        min_child_weight=3,
-        reg_alpha=0.05,     # L1 regularisation -- helps with sparse features
-        reg_lambda=1.5,     # L2 regularisation
-        objective="reg:squarederror",
-        eval_metric="mae",
-        early_stopping_rounds=30,
-        random_state=42,
-        verbosity=0,
-    )
 
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        verbose=False,
+def _seed_everything(seed: int) -> None:
+    """Seed all local RNGs used by the trainer for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+
+def _gpu_is_available() -> bool:
+    """Best-effort GPU detection for XGBoost training."""
+    try:
+        import shutil
+        import subprocess
+
+        if shutil.which("nvidia-smi") is None:
+            return False
+        probe = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return probe.returncode == 0 and bool(probe.stdout.strip())
+    except Exception:
+        return False
+
+
+def _build_training_params(seed: int, use_gpu: bool) -> dict:
+    """Return the production training hyperparameters and device settings."""
+    params = {
+        "n_estimators": 5000,
+        "max_depth": 8,
+        "learning_rate": 0.02,
+        "subsample": 0.80,
+        "colsample_bytree": 0.8,
+        "min_child_weight": 5,
+        "gamma": 0.2,
+        "max_bin": 256,
+        "reg_alpha": 0.05,
+        "reg_lambda": 1.0,
+        "objective": "reg:squarederror",
+        "random_state": seed,
+        "seed": seed,
+        "n_jobs": -1,
+        "verbosity": 200,
+        "early_stopping_rounds": 100,
+        "device": "cuda:0",
+        "tree_method": "hist",
+    }
+    return params
+
+# ---------------------------------------------------------------------------
+# Train/test split — by event, not by row
+# ---------------------------------------------------------------------------
+
+def split_by_event(
+    df: pd.DataFrame,
+    test_size: float = 0.15,
+    seed: int = 42,
+) -> tuple:
+    """
+    Split rows by unique event_id so that all (pod, node) pairs from the
+    same scheduling event stay on the same side of the split.
+    """
+    events = df[GROUP_COLUMN].unique()
+    splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+    groups = df[GROUP_COLUMN].values
+
+    train_idx, test_idx = next(splitter.split(df, groups=groups))
+
+    train_df = df.iloc[train_idx]
+    test_df  = df.iloc[test_idx]
+    
+    # MEMORY FIX: We do not need a copy of the massive 19M+ row training 
+    # dataframe for evaluation. We only need the test set. 
+    train_df_full = None
+    test_df_full = test_df.copy()
+
+    # MEMORY FIX: Use .loc to simultaneously filter feasible rows AND 
+    # select only the needed columns before copying. This prevents pandas 
+    # from creating massive intermediate dataframes in memory.
+    X_train = train_df.loc[train_df["feasible"], FEATURE_COLUMNS].copy()
+    y_train = train_df.loc[train_df["feasible"], TARGET_COLUMN].copy()
+    
+    X_test = test_df.loc[test_df["feasible"], FEATURE_COLUMNS].copy()
+    y_test = test_df.loc[test_df["feasible"], TARGET_COLUMN].copy()
+
+    train_events = train_df[GROUP_COLUMN].nunique()
+    test_events = test_df[GROUP_COLUMN].nunique()
+
+    logger.info(
+        "Train: %d rows across %d events | Test: %d rows across %d events",
+        len(X_train), train_events, len(X_test), test_events,
     )
+    
+    # Returning None for train_df_full keeps the function signature intact
+    return X_train, X_test, y_train, y_test, train_events, test_events, train_df_full, test_df_full
+
+# ---------------------------------------------------------------------------
+# Model training
+# ---------------------------------------------------------------------------
+
+def train(X_train: pd.DataFrame, X_test: pd.DataFrame,
+          y_train: pd.Series, y_test: pd.Series,
+          train_df_full: pd.DataFrame, test_df_full: pd.DataFrame,
+          seed: int) -> tuple[XGBRegressor, dict, dict]:
+    """Train an XGBoost regression model to approximate the teacher scorer.
+
+    The saved artifact is the regression model only, to remain runtime-compatible.
+    Evaluation additionally records ranking metrics and artifact metadata.
+    """
+    use_gpu = _gpu_is_available()
+    training_params = _build_training_params(seed=seed, use_gpu=use_gpu)
+    model = XGBRegressor(**training_params)
+
+    fit_kwargs = {
+        "X": X_train,
+        "y": y_train,
+        "eval_set": [(X_test, y_test)],
+        "verbose": False,
+    }
+    model.fit(**fit_kwargs)
 
     preds = model.predict(X_test)
+    preds = np.clip(preds, 0.0, 100.0)
     mae = mean_absolute_error(y_test, preds)
-    logger.info("Training complete -- test MAE: %.2f / 100", mae)
+    rmse = mean_squared_error(y_test, preds, squared=False)
+    medae = median_absolute_error(y_test, preds)
+    mask_nonzero = y_test.values != 0
+    mape = mean_absolute_percentage_error(y_test.values[mask_nonzero], preds[mask_nonzero]) if mask_nonzero.any() else 0.0
+    r2 = r2_score(y_test, preds)
+    explained_var = explained_variance_score(y_test, preds)
+    best_iteration = int(getattr(model, "best_iteration", model.n_estimators - 1) or 0)
+    logger.info(
+        "Training complete — test MAE: %.2f / 100 | RMSE: %.2f | MedAE: %.2f | MAPE: %.3f | R2: %.3f | EVS: %.3f",
+        mae, rmse, medae, mape, r2, explained_var,
+    )
 
-    # Log per-scenario performance breakdown for visibility
-    df_test = X_test.copy()
-    df_test["y_true"] = y_test.values
-    df_test["y_pred"] = preds
-    _log_score_band_mae(df_test)
+    _log_score_band_mae(y_test.values, preds)
+    _log_feature_importance(model)
 
-    return model
+    # Ranking-focused evaluation: winner/top-k accuracy and rank correlations
+    try:
+        # Optional ranking correlation imports — continue if scipy missing
+        try:
+            from scipy.stats import spearmanr, kendalltau
+        except Exception:
+            spearmanr = None
+            kendalltau = None
+        # Attach predictions back to test_df_full by index alignment
+        test_df_full = test_df_full.copy()
+        
+        # We already predicted on X_test (which is the feasible rows of test_df_full)
+        # Avoid re-predicting by directly assigning the predictions back
+        feas_df = test_df_full[test_df_full["feasible"]].copy()
+        feas_df = feas_df.assign(pred_score=preds)
+
+        # Winner and top-3 accuracy
+        winner_acc_n = 0
+        top3_acc_n = 0
+        events = 0
+        spearman_vals = []
+        kendall_vals = []
+        for event_id, g in feas_df.groupby(GROUP_COLUMN):
+            # true winner node_id where selected_by_scheduler==1
+            winners = g[g["selected_by_scheduler"] == 1]
+            if winners.empty:
+                continue
+            events += 1
+            true_winner = winners.iloc[0]["node_id"]
+            preds_sorted = g.sort_values("pred_score", ascending=False)
+            pred_top1 = preds_sorted.iloc[0]["node_id"]
+            topk = preds_sorted.head(3)["node_id"].tolist()
+            if pred_top1 == true_winner:
+                winner_acc_n += 1
+            if true_winner in topk:
+                top3_acc_n += 1
+
+            # rank correlations
+            try:
+                if spearmanr is not None:
+                    sr = spearmanr(g["teacher_score"].values, g["pred_score"].values)
+                    if getattr(sr, "correlation", None) is not None:
+                        spearman_vals.append(sr.correlation)
+            except Exception:
+                pass
+            try:
+                if kendalltau is not None:
+                    kt = kendalltau(g["teacher_score"].values, g["pred_score"].values)
+                    if getattr(kt, "correlation", None) is not None:
+                        kendall_vals.append(kt.correlation)
+            except Exception:
+                pass
+
+        winner_acc = winner_acc_n / events if events > 0 else 0.0
+        top3_acc = top3_acc_n / events if events > 0 else 0.0
+        mean_spearman = float(sum(spearman_vals) / len(spearman_vals)) if spearman_vals else 0.0
+        mean_kendall = float(sum(kendall_vals) / len(kendall_vals)) if kendall_vals else 0.0
+
+        logger.info("Winner accuracy: %.3f | Top-3 accuracy: %.3f", winner_acc, top3_acc)
+        logger.info("Mean Spearman: %.3f | Mean Kendall: %.3f", mean_spearman, mean_kendall)
+    except Exception as exc:
+        logger.warning("Ranking evaluation skipped due to error: %s", exc)
+
+    metrics = {
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "median_absolute_error": float(medae),
+        "mape": float(mape),
+        "r2": float(r2),
+        "explained_variance": float(explained_var),
+        "winner_accuracy": float(winner_acc if 'winner_acc' in locals() else 0.0),
+        "top3_accuracy": float(top3_acc if 'top3_acc' in locals() else 0.0),
+        "best_iteration": int(best_iteration),
+    }
+
+    return model, metrics, training_params
 
 
-def _log_score_band_mae(df_test: pd.DataFrame) -> None:
-    """Log MAE broken down by the original score bands for diagnostic clarity."""
+def _log_score_band_mae(y_true: np.ndarray, y_pred: np.ndarray) -> None:
+    """Log MAE per score band for diagnostic clarity."""
     bands = [
-        ("fully_saturated",  0,   12),
-        ("stressed",         4,   36),
-        ("mixed_stress",     8,   35),
-        ("memory_pressure",  18,  42),
-        ("cpu_burst",        22,  50),
-        ("network_bound",    30,  58),
-        ("near_capacity",    42,  62),
-        ("moderate",         40,  70),
-        ("healthy_active",   78,  92),
-        ("healthy_idle",     88, 100),
+        ("0-20  (saturated)",   0,  20),
+        ("20-40 (stressed)",   20,  40),
+        ("40-60 (moderate)",   40,  60),
+        ("60-80 (healthy)",    60,  80),
+        ("80-100 (idle)",      80, 100),
     ]
+    logger.info("MAE by teacher score band:")
     for label, lo, hi in bands:
-        mask = (df_test["y_true"] >= lo) & (df_test["y_true"] <= hi)
-        subset = df_test[mask]
-        if len(subset) > 0:
-            band_mae = mean_absolute_error(subset["y_true"], subset["y_pred"])
-            logger.info("  [%s] n=%d  MAE=%.2f", label, len(subset), band_mae)
+        mask = (y_true >= lo) & (y_true < hi)
+        if mask.sum() > 0:
+            band_mae = mean_absolute_error(y_true[mask], y_pred[mask])
+            logger.info("  [%s] n=%d  MAE=%.2f", label, mask.sum(), band_mae)
 
 
-def save(model: XGBRegressor) -> None:
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(model, f)
+def _log_feature_importance(model: XGBRegressor) -> None:
+    """Log the top-10 features for gain, weight, and cover importance."""
+    booster = model.get_booster()
+    for importance_type in ("gain", "weight", "cover"):
+        importance = booster.get_score(importance_type=importance_type)
+        sorted_imp = sorted(importance.items(), key=lambda x: -x[1])
+        logger.info("Top-10 features by %s importance:", importance_type)
+        for i, (fname, score) in enumerate(sorted_imp[:10], 1):
+            logger.info("  %2d. %-35s %s=%.1f", i, fname, importance_type, score)
+
+
+# ---------------------------------------------------------------------------
+# Save
+# ---------------------------------------------------------------------------
+
+def save(model: XGBRegressor, metadata: dict) -> None:
+    os.makedirs(_MODEL_DIR, exist_ok=True)
+    model.save_model(MODEL_PATH)
+    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
     logger.info("Model saved to %s", MODEL_PATH)
+    logger.info("Metadata saved to %s", METADATA_PATH)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Train the Niyojak student model from the teacher dataset.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--dataset-path", default="",
+        help="Path to teacher_dataset.csv or .parquet.  "
+             "Defaults to data/teacher_dataset.parquet (then .csv).",
+    )
+    parser.add_argument(
+        "--test-size", type=float, default=0.15,
+        help="Fraction of events to hold out for evaluation.",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for train/test split.",
+    )
+    args = parser.parse_args()
+
+    _seed_everything(args.seed)
+
+    logger.info("Step 1/5: Loading dataset...")
+    df, dataset_path = load_dataset(args.dataset_path)
+
+    # Sanity-check that the required columns are present
+    logger.info("Step 2/5: Validating schema and computing statistics...")
+    missing = [c for c in FEATURE_COLUMNS + [TARGET_COLUMN, GROUP_COLUMN]
+               if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Dataset is missing columns: {missing}\n"
+            "Regenerate with: python train/generate_dataset.py"
+        )
+
+    logger.info(
+        "Dataset loaded: %d rows | %d events | %d feature columns",
+        len(df), df[GROUP_COLUMN].nunique(), len(FEATURE_COLUMNS),
+    )
+    
+    logger.info("Computing score distribution (this may take a moment on massive datasets)...")
+    feas_scores = df.loc[df["feasible"], TARGET_COLUMN]
+    logger.info(
+        "Teacher score distribution: min=%.1f  mean=%.1f  max=%.1f  std=%.1f",
+        feas_scores.min(),
+        feas_scores.mean(),
+        feas_scores.max(),
+        feas_scores.std(),
+    )
+
+    logger.info("Step 3/5: Performing event-level train/test split...")
+    X_train, X_test, y_train, y_test, tr_ev, te_ev, train_df_full, test_df_full = split_by_event(
+        df, test_size=args.test_size, seed=args.seed
+    )
+
+    logger.info("Step 4/5: Training XGBoost student model...")
+    logger.info(
+        "Training on %d feasible rows (%d events)...",
+        len(X_train), tr_ev,
+    )
+    model, metrics, training_params = train(
+        X_train, X_test, y_train, y_test, train_df_full, test_df_full, seed=args.seed
+    )
+    
+    logger.info("Step 5/5: Preparing evaluation metrics and saving artifacts...")
+
+    metadata = {
+        "feature_columns": FEATURE_COLUMNS,
+        "training_parameters": training_params,
+        "dataset_path": os.path.abspath(dataset_path),
+        "dataset_size": {
+            "rows": int(len(df)),
+            "events": int(df[GROUP_COLUMN].nunique()),
+            "feasible_rows": int(df["feasible"].sum()),
+            "infeasible_rows": int((~df["feasible"]).sum()),
+        },
+        "xgboost_version": xgb.__version__,
+        "training_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "mae": metrics["mae"],
+        "rmse": metrics["rmse"],
+        "r2": metrics["r2"],
+        "median_absolute_error": metrics["median_absolute_error"],
+        "mape": metrics["mape"],
+        "explained_variance": metrics["explained_variance"],
+        "winner_accuracy": metrics["winner_accuracy"],
+        "top3_accuracy": metrics["top3_accuracy"],
+        "best_iteration": metrics["best_iteration"],
+    }
+
+    save(model, metadata)
+    logger.info("Done. Run the AI service to use this model.")
 
 
 if __name__ == "__main__":
-    logger.info(
-        "Generating synthetic training data (%d samples, 10 scenarios)...",
-        N_SAMPLES_DEFAULT,
-    )
-    df = generate_dataset(n_samples=N_SAMPLES_DEFAULT)
-
-    logger.info(
-        "Score distribution: min=%.1f  mean=%.1f  max=%.1f  std=%.1f",
-        df["score"].min(), df["score"].mean(), df["score"].max(), df["score"].std(),
-    )
-    logger.info("Scenario sample counts:")
-    bands = [(0, 12), (4, 36), (8, 35), (18, 42), (22, 50),
-             (30, 58), (40, 70), (42, 62), (78, 92), (88, 100)]
-    for lo, hi in bands:
-        count = ((df["score"] >= lo) & (df["score"] <= hi)).sum()
-        logger.info("  score %3d-%3d: %d samples", lo, hi, count)
-
-    logger.info("Training XGBoost model (n_estimators=400, max_depth=6)...")
-    model = train(df)
-
-    save(model)
-    logger.info("Done. Run the AI service to use this model.")
+    main()

@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 
-# Stage 1: train the model
-# Runs train_model.py to produce niyojak_model.pkl inside the image.
-# If you want to supply a pre-trained model instead, you can skip this stage
-# and COPY the .pkl file directly in stage 2.
+# Stage 1: runtime image only.
+# The model (niyojak_model.json) is pre-trained offline and COPY-ed in below.
+# To rebuild with a fresh model: run train/train_model.py locally first,
+# then rebuild this image so the new model/niyojak_model.json is picked up.
 FROM python:3.11-slim AS trainer
 
 WORKDIR /train
@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app/  ./app/
 COPY train/ ./train/
 
-# Run training — produces model/niyojak_model.pkl
+# Run training — produces model/niyojak_model.json
 RUN python train/train_model.py
 
 
@@ -33,12 +33,11 @@ COPY app/ ./app/
 # Copy trained model from the trainer stage
 COPY --from=trainer /train/model/ ./model/
 
-# Set environment defaults (overridable at runtime via K8s env vars or Helm values)
+# Set environment defaults (overridable at runtime via K8s env vars)
 ENV PORT=8000 \
-    PROMETHEUS_URL=http://prometheus:9090 \
-    MODEL_PATH=/app/model/niyojak_model.pkl \
-    POLL_INTERVAL_SEC=5 \
-    WINDOW_SIZE=12
+    K8S_API_URL=https://kubernetes.default.svc \
+    MODEL_PATH=/app/model/niyojak_model.json \
+    POLL_INTERVAL_SEC=5
 
 EXPOSE 8000
 
