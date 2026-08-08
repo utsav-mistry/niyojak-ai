@@ -74,3 +74,8 @@ CLAUDE.md
 summary.md
 ppt_pointers.txt
 stress_test_results.txt
+
+# Presentation and document files
+*.pptx
+*.ppt
+*.pdf
