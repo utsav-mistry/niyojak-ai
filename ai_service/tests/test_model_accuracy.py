@@ -157,20 +157,44 @@ def derive_features(node: dict, pod: dict) -> dict:
 
 
 def predict_raw(model: xgb.XGBRegressor, node: dict, pod: dict) -> float:
-    features = derive_features(node, pod)
-    row = [features[col] for col in FEATURE_COLUMNS]
-    df  = pd.DataFrame([row], columns=FEATURE_COLUMNS)
-    return float(np.clip(np.round(model.predict(df)[0]), MIN_SCORE, MAX_SCORE))
-
-
-def predict_final(model: xgb.XGBRegressor, node: dict, pod: dict) -> float:
     """
-    Return the model's ranking score for a node-pod pair.
+    Predict the teacher score for a node/pod pair.
 
-    The model was trained to predict teacher_score directly — a value that
-    already incorporates piecewise-linear penalties.  Subtracting penalties
-    a second time would double-penalise (raw - 2*penalty ≈ 0 for any loaded
-    node).  Therefore we use the raw model output as the final score.
+    The model was trained directly on `teacher_score`, so this is the
+    model's raw learned score. No heuristic penalty is applied here.
+    """
+    features = derive_features(node, pod)
+
+    row = [features[col] for col in FEATURE_COLUMNS]
+    df = pd.DataFrame([row], columns=FEATURE_COLUMNS)
+
+    prediction = model.predict(df)[0]
+
+    return float(np.clip(
+        prediction,
+        MIN_SCORE,
+        MAX_SCORE,
+    ))
+
+
+def predict_final(
+    model: xgb.XGBRegressor,
+    node: dict,
+    pod: dict,
+) -> float:
+    """
+    Return the model's final ranking score.
+
+    IMPORTANT:
+    The XGBoost model was trained to predict `teacher_score` directly.
+    `teacher_score` already includes the piecewise penalty from the
+    scheduler's scoring formula.
+
+    Therefore:
+        final_score = model_prediction
+
+    Do NOT subtract the piecewise penalty again.
+    Doing so would double-penalize loaded nodes and distort ranking.
     """
     return predict_raw(model, node, pod)
 
@@ -610,3 +634,9 @@ class TestEdgeCases:
         ts   = teacher_score(node, pod)
         # proj_cpu ≈ 0, proj_mem ≈ 0 → base ≈ 100, penalties ≈ 0 → score ≈ 100
         assert ts >= 95.0, f"Near-idle teacher score = {ts:.2f}, expected ~100"
+
+
+# Run these tests:
+# ------------------------------------------------------------------------------------------
+# python -m pytest tests/test_model_accuracy.py -v
+# ------------------------------------------------------------------------------------------

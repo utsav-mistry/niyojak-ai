@@ -17,9 +17,19 @@ A separate legacy_step_penalty() function preserves the old hard step-function
 
 import os
 import random
+import sys
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+
+# ---------------------------------------------------------------------------
+# Constants & Thresholds
+# ---------------------------------------------------------------------------
+MASTER_SEED = 42
+
+EXACT_MATCH_THRESHOLD = 85.0
+AVG_RANK_THRESHOLD = 1.25
+AVG_SCORE_GAP_THRESHOLD = 5.0
 
 # ---------------------------------------------------------------------------
 # Model path
@@ -101,27 +111,34 @@ CPU_HEADROOM_WEIGHT = 0.60
 MEM_HEADROOM_WEIGHT = 0.40
 
 # Acceptable-score threshold for candidate preference
-MIN_ACCEPTABLE_SCORE = 5   # lowered from 20: piecewise scores can be in 0-15 range under stress
+MIN_ACCEPTABLE_SCORE = 5
 
 # ---------------------------------------------------------------------------
 # Node hardware — allocatable values matching generate_dataset.py profiles
-# (cpu_milli * 0.95, mem_bytes * 0.92) to stay within model training distribution.
-# Using raw round numbers like 4000/8000/16000m or 8/16/32GB is OOD.
 # ---------------------------------------------------------------------------
 _GB = 1024 * 1024 * 1024
-CPU_CAPACITIES_MILLI = [1_900, 3_800, 7_600, 15_200]   # small/medium/large/xlarge alloc
+CPU_CAPACITIES_MILLI = [1_900, 3_800, 7_600, 15_200]
 MEM_CAPACITIES_BYTES = [
-    int(3.68  * _GB),   # small:   4GB  * 0.92
-    int(7.36  * _GB),   # medium:  8GB  * 0.92
-    int(14.72 * _GB),   # large:  16GB  * 0.92
-    int(29.44 * _GB),   # xlarge: 32GB  * 0.92
+    int(3.68  * _GB),
+    int(7.36  * _GB),
+    int(14.72 * _GB),
+    int(29.44 * _GB),
+]
+
+scenarios_list = [
+    "optimistic",
+    "normal",
+    "fragmented",
+    "congested",
+    "near_saturation",
+    "unschedulable",
+    "mixed"
 ]
 
 
 # ===========================================================================
-# Piecewise-linear helper — mirrors _piecewise_linear_penalty() in generate_dataset.py
+# Piecewise-linear helper
 # ===========================================================================
-
 def _piecewise_linear_penalty(value: float, points: tuple) -> float:
     """Evaluate a monotone piecewise-linear penalty curve."""
     x = max(0.0, min(1.0, value))
@@ -140,14 +157,38 @@ def _piecewise_linear_penalty(value: float, points: tuple) -> float:
 # ===========================================================================
 # Hardened Node / Pod Generation
 # ===========================================================================
-
-def generate_node(name, cluster_size):
+def generate_node(name, cluster_size, scenario="congested"):
     alloc_cpu = random.choice(CPU_CAPACITIES_MILLI)
     alloc_mem = random.choice(MEM_CAPACITIES_BYTES)
 
-    # Beta(3.0, 3.0) centers initial load around 50%–75%
-    init_cpu_util = random.betavariate(3.0, 3.0)
-    init_mem_util = random.betavariate(3.0, 3.0)
+    if scenario == "mixed":
+        scenario = random.choice(["optimistic", "normal", "fragmented", "congested", "near_saturation"])
+
+    if scenario == "optimistic":
+        init_cpu_util = random.uniform(0.05, 0.20)
+        init_mem_util = random.uniform(0.05, 0.20)
+    elif scenario == "normal":
+        init_cpu_util = random.uniform(0.30, 0.50)
+        init_mem_util = random.uniform(0.30, 0.50)
+    elif scenario == "fragmented":
+        if random.random() > 0.5:
+            init_cpu_util = random.uniform(0.80, 0.95)
+            init_mem_util = random.uniform(0.05, 0.20)
+        else:
+            init_cpu_util = random.uniform(0.05, 0.20)
+            init_mem_util = random.uniform(0.80, 0.95)
+    elif scenario == "congested":
+        init_cpu_util = random.betavariate(3.0, 3.0)
+        init_mem_util = random.betavariate(3.0, 3.0)
+    elif scenario == "near_saturation":
+        init_cpu_util = random.uniform(0.85, 0.95)
+        init_mem_util = random.uniform(0.85, 0.95)
+    elif scenario == "unschedulable":
+        init_cpu_util = random.uniform(0.95, 1.0)
+        init_mem_util = random.uniform(0.95, 1.0)
+    else:
+        init_cpu_util = 0.5
+        init_mem_util = 0.5
 
     req_cpu = int(alloc_cpu * init_cpu_util)
     req_mem = int(alloc_mem * init_mem_util)
@@ -166,7 +207,7 @@ def generate_node(name, cluster_size):
 
 
 def generate_pod(pod_id):
-    """Generate large, resource-intensive pods (1 to 8 cores, 2 GB to 16 GB RAM)."""
+    """Generate large, resource-intensive pods."""
     return {
         "pod_name":      f"heavy-pod-{pod_id}",
         "req_cpu_milli": random.randint(1_000, 8_000),
@@ -175,17 +216,17 @@ def generate_pod(pod_id):
 
 
 def filter_nodes(nodes, pod):
+    """Filter nodes based on available (allocatable - requested) capacity."""
     return [
         node for node in nodes
-        if (pod["req_cpu_milli"] <= node["allocatable_cpu_milli"] and
-            pod["req_mem_bytes"] <= node["allocatable_mem_bytes"])
+        if (pod["req_cpu_milli"] <= node["allocatable_cpu_milli"] - node["requested_cpu_milli"] and
+            pod["req_mem_bytes"] <= node["allocatable_mem_bytes"] - node["requested_mem_bytes"])
     ]
 
 
 # ===========================================================================
 # Feature derivation
 # ===========================================================================
-
 def derive_features(node, pod):
     alloc_cpu = node["allocatable_cpu_milli"]
     alloc_mem = node["allocatable_mem_bytes"]
@@ -208,7 +249,6 @@ def derive_features(node, pod):
     resource_balance  = abs(proj_cpu_pct - proj_mem_pct)
     cpu_request_ratio = pod["req_cpu_milli"] / alloc_cpu if alloc_cpu > 0 else 0.0
     mem_request_ratio = pod["req_mem_bytes"] / alloc_mem if alloc_mem > 0 else 0.0
-    # packing_density mirrors generate_dataset.py: projected pod count / 110
     packing_density   = (node["pod_count"] + 1) / 110.0
 
     return {
@@ -236,12 +276,8 @@ def derive_features(node, pod):
 # ===========================================================================
 # Penalty functions
 # ===========================================================================
-
 def calculate_piecewise_penalty(node, pod):
-    """
-    Piecewise-linear penalty — matches generate_dataset.py teacher formula.
-    This is what the model was trained to approximate.
-    """
+    """Piecewise-linear penalty — matches training baseline."""
     alloc_cpu = node["allocatable_cpu_milli"]
     alloc_mem = node["allocatable_mem_bytes"]
 
@@ -258,10 +294,7 @@ def calculate_piecewise_penalty(node, pod):
 
 
 def legacy_step_penalty(node, pod):
-    """
-    Hard step-function penalty (old heuristic baseline).
-    Kept for comparison — NOT used for AI score correction.
-    """
+    """Hard step-function penalty (old heuristic baseline) for debug."""
     alloc_cpu = node["allocatable_cpu_milli"]
     alloc_mem = node["allocatable_mem_bytes"]
 
@@ -282,27 +315,18 @@ def legacy_step_penalty(node, pod):
 # ===========================================================================
 # Scoring functions
 # ===========================================================================
-
 def ai_score_node(model, node, pod):
-    """
-    Score a node using the AI model.
-
-    The model predicts teacher_score directly — a value that already
-    incorporates the piecewise-linear penalty.  We use the raw model output
-    as the final ranking score and keep the penalty breakdown as debug
-    information only (NOT subtracted from final).
-    """
+    """Score a node using the AI model (no double penalty)."""
     features = derive_features(node, pod)
     row = [features[col] for col in FEATURE_COLUMNS]
     df = pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
-    raw = float(np.clip(np.round(model.predict(df)[0]), MIN_SCORE, MAX_SCORE))
-    # Penalty breakdown — kept for debug display, NOT subtracted from raw
+    raw = float(np.clip(model.predict(df)[0], MIN_SCORE, MAX_SCORE))
     penalty, proj_cpu, proj_mem, dp, cp, mp = calculate_piecewise_penalty(node, pod)
 
     return raw, {
         "ai_score":        raw,
-        "final_score":     raw,    # same as ai_score: no double-penalisation
+        "final_score":     raw,
         "cpu_util":        proj_cpu,
         "mem_util":        proj_mem,
         "cpu_penalty":     cp,
@@ -314,10 +338,7 @@ def ai_score_node(model, node, pod):
 
 
 def heuristic_score_node(node, pod):
-    """
-    Teacher-faithful heuristic: piecewise-linear penalties + 60/40 headroom weighting.
-    Matches generate_dataset.py teacher_score_node() and is used as the ground-truth baseline.
-    """
+    """Teacher-faithful heuristic matching ground-truth baseline."""
     alloc_cpu = node["allocatable_cpu_milli"]
     alloc_mem = node["allocatable_mem_bytes"]
 
@@ -347,49 +368,59 @@ def update_node_state(node, pod):
 # ===========================================================================
 # Stats accumulator
 # ===========================================================================
-
-stats = {
-    "clusters_tested":    0,
-    "total_placements":   0,
-    "unschedulable_pods": 0,
-    "exact_matches":      0,
-    "ai_rank_sum":        0,
-    "score_gap_sum":      0.0,
+scenario_stats = {
+    s: {
+        "tests": 0,
+        "total_pods": 0,
+        "successful_placements": 0,
+        "unschedulable": 0,
+        "exact_matches": 0,
+        "ai_rank_sum": 0,
+        "score_gap_sum": 0.0,
+        "max_score_gap": 0.0,
+        "non_optimal_picks": 0,
+        "ai_rank_gt_1": 0,
+        "capacity_violations": 0
+    }
+    for s in scenarios_list
 }
 
 
-def run_test(model, test_id, pods_per_cluster=12):
+def run_test(model, test_id, scenario, test_number, pods_per_cluster=12):
+    seed = MASTER_SEED + test_id
+    random.seed(seed)
+    np.random.seed(seed)
+
     num_nodes = random.randint(5, 10)
     print(f"\n{'='*80}")
-    print(f" STRESS TEST #{test_id} -- CONGESTED CLUSTER: {num_nodes} NODES | {pods_per_cluster} HEAVY PODS")
+    print(f"SCENARIO: {scenario.upper()} | TEST {test_number}/5 | CLUSTER: {num_nodes} NODES | {pods_per_cluster} PODS")
     print(f"{'='*80}")
 
-    stats["clusters_tested"] += 1
+    scenario_stats[scenario]["tests"] += 1
 
-    nodes = [generate_node(f"node-{i:02d}", num_nodes) for i in range(1, num_nodes + 1)]
+    nodes = [generate_node(f"node-{i:02d}", num_nodes, scenario) for i in range(1, num_nodes + 1)]
     pods  = [generate_pod(i) for i in range(1, pods_per_cluster + 1)]
 
     for pod in pods:
+        scenario_stats[scenario]["total_pods"] += 1
         cpu_cores = pod["req_cpu_milli"] / 1000.0
         gb = pod["req_mem_bytes"] / (1024 ** 3)
         print(f"\n--- Scheduling {pod['pod_name']} (Demands: {cpu_cores:.3f} Cores, {gb:.1f}GB RAM) ---")
 
         eligible = filter_nodes(nodes, pod)
         if not eligible:
-            print("  ⚠️  REJECTED / UNSCHEDULABLE: All nodes lack sufficient capacity under heavy load.")
-            stats["unschedulable_pods"] += 1
+            print("REJECTED / UNSCHEDULABLE")
+            scenario_stats[scenario]["unschedulable"] += 1
             continue
 
-        stats["total_placements"] += 1
+        scenario_stats[scenario]["successful_placements"] += 1
 
-        # Teacher-faithful heuristic baseline (piecewise-linear, matches training)
         for node in eligible:
             node["heuristic_score"] = heuristic_score_node(node, pod)
         h_sorted = sorted(eligible, key=lambda n: n["heuristic_score"], reverse=True)
         h_best       = h_sorted[0]
         h_best_score = h_best["heuristic_score"]
 
-        # AI scoring (with piecewise penalty correction)
         details_map = {}
         for node in eligible:
             final, details = ai_score_node(model, node, pod)
@@ -402,46 +433,161 @@ def run_test(model, test_id, pods_per_cluster=12):
         ai_best    = ai_sorted[0]
         wd         = details_map[ai_best["node_name"]]
 
+        # Stats collection for successful placements
         if h_best["node_name"] == ai_best["node_name"]:
-            stats["exact_matches"] += 1
+            scenario_stats[scenario]["exact_matches"] += 1
+        else:
+            scenario_stats[scenario]["non_optimal_picks"] += 1
 
         ai_rank = next(
             (i + 1 for i, n in enumerate(h_sorted) if n["node_name"] == ai_best["node_name"]),
             len(eligible),
         )
-        stats["ai_rank_sum"] += ai_rank
+        scenario_stats[scenario]["ai_rank_sum"] += ai_rank
+        if ai_rank > 1:
+            scenario_stats[scenario]["ai_rank_gt_1"] += 1
 
         ai_heuristic_score = next(
             n["heuristic_score"] for n in eligible if n["node_name"] == ai_best["node_name"]
         )
         score_gap = h_best_score - ai_heuristic_score
-        stats["score_gap_sum"] += score_gap
+        scenario_stats[scenario]["score_gap_sum"] += score_gap
+        scenario_stats[scenario]["max_score_gap"] = max(scenario_stats[scenario]["max_score_gap"], score_gap)
 
-        # Legacy step-function penalty for reference
+        # Invariant: Capacity Verification
+        if (pod["req_cpu_milli"] > ai_best["allocatable_cpu_milli"] - ai_best["requested_cpu_milli"] or
+            pod["req_mem_bytes"] > ai_best["allocatable_mem_bytes"] - ai_best["requested_mem_bytes"]):
+            print("!!! CAPACITY VIOLATION !!!")
+            scenario_stats[scenario]["capacity_violations"] += 1
+
         legacy_pen = legacy_step_penalty(ai_best, pod)
 
-        print(f"  Heuristic Pick  : {h_best['node_name']} (Score: {h_best_score:.2f})")
-        print(
-            f"  AI Pick         : {ai_best['node_name']} "
-            f"(Score: {wd['final_score']:.2f} | PW Penalty[debug]: {wd['total_penalty']:.2f} | Legacy Penalty[debug]: {legacy_pen})"
-        )
+        print(f"  Heuristic Pick   : {h_best['node_name']} (Score: {h_best_score:.2f})")
+        print(f"  AI Pick          : {ai_best['node_name']} (Score: {wd['final_score']:.2f} | PW Penalty[debug]: {wd['total_penalty']:.2f} | Legacy Penalty[debug]: {legacy_pen})")
         print(f"  AI Heuristic Rank: #{ai_rank} | Score Gap: {score_gap:.2f}")
 
         update_node_state(ai_best, pod)
 
 
+def evaluate_scenario(stats):
+    if stats["capacity_violations"] > 0:
+        return "FAIL"
+    n = stats["successful_placements"]
+    if n == 0:
+        return "PASS"
+    exact_match_pct = (stats["exact_matches"] / n) * 100
+    avg_rank = stats["ai_rank_sum"] / n
+    avg_gap = stats["score_gap_sum"] / n
+    if (exact_match_pct >= EXACT_MATCH_THRESHOLD and
+        avg_rank <= AVG_RANK_THRESHOLD and
+        avg_gap <= AVG_SCORE_GAP_THRESHOLD):
+        return "PASS"
+    return "REVIEW"
+
+
 def print_summary():
-    n = stats["total_placements"]
+    overall_tests = 0
+    overall_pods = 0
+    overall_placements = 0
+    overall_unsched = 0
+    overall_exact = 0
+    overall_ai_rank_sum = 0
+    overall_gap_sum = 0.0
+    overall_cap_viol = 0
+
+    for s in scenarios_list:
+        st = scenario_stats[s]
+        overall_tests += st["tests"]
+        overall_pods += st["total_pods"]
+        overall_placements += st["successful_placements"]
+        overall_unsched += st["unschedulable"]
+        overall_exact += st["exact_matches"]
+        overall_ai_rank_sum += st["ai_rank_sum"]
+        overall_gap_sum += st["score_gap_sum"]
+        overall_cap_viol += st["capacity_violations"]
+
+        print(f"\n{'='*80}")
+        print(f"SCENARIO SUMMARY: {s.upper()}")
+        print(f"{'='*80}")
+        print(f"Tests                         : {st['tests']}")
+        print(f"Total pods                    : {st['total_pods']}")
+        print(f"Successful placements         : {st['successful_placements']}")
+        print(f"Unschedulable                 : {st['unschedulable']}")
+        print(f"Capacity violations           : {st['capacity_violations']}")
+
+        n = st["successful_placements"]
+        if n > 0:
+            print(f"Scheduling success rate      : {(n / st['total_pods']) * 100:.1f}%")
+            print(f"Exact AI/Heuristic match     : {(st['exact_matches'] / n) * 100:.1f}%")
+            print(f"Avg AI heuristic rank        : #{st['ai_rank_sum'] / n:.2f}")
+            print(f"Avg score gap                : {st['score_gap_sum'] / n:.2f}")
+            print(f"Max score gap                : {st['max_score_gap']:.2f}")
+            print(f"Non-optimal AI picks         : {st['non_optimal_picks']}")
+            print(f"AI rank > 1                  : {st['ai_rank_gt_1']}")
+        else:
+            print("Scheduling success rate      : 0.0%")
+            print("Exact AI/Heuristic match     : N/A")
+            print("Avg AI heuristic rank        : N/A")
+            print("Avg score gap                : N/A")
+            print("Max score gap                : N/A")
+            print("Non-optimal AI picks         : N/A")
+            print("AI rank > 1                  : N/A")
+
+        print(f"Result                       : {evaluate_scenario(st)}")
+
     print(f"\n{'='*80}")
-    print(" HARDENED STRESS-TEST SUMMARY STATISTICS")
+    print("OVERALL SUMMARY")
     print(f"{'='*80}")
-    print(f"Clusters tested              : {stats['clusters_tested']}")
-    print(f"Successful placements        : {n}")
-    print(f"Rejected / Unschedulable     : {stats['unschedulable_pods']}")
-    if n > 0:
-        print(f"Exact match (AI = heuristic) : {(stats['exact_matches'] / n) * 100:.1f}%")
-        print(f"Avg heuristic rank of AI pick: #{stats['ai_rank_sum'] / n:.2f}")
-        print(f"Avg score gap from optimum   : {stats['score_gap_sum'] / n:.2f}")
+    print(f"Scenarios tested             : {len(scenarios_list)}")
+    print(f"Tests per scenario           : 5")
+    print(f"Total cluster tests          : {overall_tests}")
+    print(f"Total pods                   : {overall_pods}")
+    print(f"Successful placements        : {overall_placements}")
+    print(f"Unschedulable                : {overall_unsched}")
+    print(f"Capacity violations          : {overall_cap_viol}")
+
+    if overall_placements > 0:
+        print(f"Overall scheduling success   : {(overall_placements / overall_pods) * 100:.1f}%")
+        print(f"Overall exact match          : {(overall_exact / overall_placements) * 100:.1f}%")
+        print(f"Overall avg heuristic rank   : #{overall_ai_rank_sum / overall_placements:.2f}")
+        print(f"Overall avg score gap        : {overall_gap_sum / overall_placements:.2f}")
+
+    print("\nScenario Distribution")
+    print("---------------------")
+    for s in scenarios_list:
+        print(f"{s:<18} {scenario_stats[s]['tests']}")
+    print(f"{'TOTAL':<18} {overall_tests}")
+
+    print("\nPod Distribution")
+    print("----------------")
+    print(f"Total generated pods       : {overall_pods}")
+    print(f"Schedulable pods           : {overall_placements}")
+    print(f"Unschedulable pods         : {overall_unsched}")
+
+
+# ---------------------------------------------------------------------------
+# Output tee — mirrors stdout to stress_test_results.txt
+# ---------------------------------------------------------------------------
+OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "stress_test_results.txt")
+
+
+class _Tee:
+    """Duplicate stdout writes to a file simultaneously."""
+    def __init__(self, filepath: str):
+        self._file = open(filepath, "w", encoding="utf-8", buffering=1)
+        self._stdout = sys.stdout
+
+    def write(self, data):
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._stdout.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+        sys.stdout = self._stdout
 
 
 def load_model():
@@ -458,8 +604,18 @@ if __name__ == "__main__":
     if model is None:
         raise SystemExit(1)
 
-    print("Successfully loaded model. Running HARDENED stress test suite...")
-    for i in range(1, 6):
-        run_test(model, i, pods_per_cluster=12)
+    tee = _Tee(OUTPUT_FILE)
+    sys.stdout = tee
+    try:
+        print(f"Results will be saved to: {OUTPUT_FILE}")
+        print("Successfully loaded model. Running HARDENED stress test suite...")
 
-    print_summary()
+        test_id = 1
+        for scenario in scenarios_list:
+            for test_number in range(1, 6):
+                run_test(model, test_id, scenario, test_number, pods_per_cluster=12)
+                test_id += 1
+
+        print_summary()
+    finally:
+        tee.close()
