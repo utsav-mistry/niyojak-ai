@@ -68,3 +68,8 @@ secrets.yaml
 # Environment files
 .env
 .env.local
+
+# Local-only documentation
+CLAUDE.md
+summary.md
+ppt_pointers.txt
